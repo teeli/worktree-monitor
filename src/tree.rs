@@ -26,6 +26,15 @@ struct Dir {
     files: Vec<(String, usize)>,
 }
 
+/// Paths of every directory row the tree can show (with all directories expanded).
+pub fn all_dirs(changes: &[FileChange]) -> HashSet<String> {
+    build(changes, &HashSet::new())
+        .into_iter()
+        .filter(|r| matches!(r.kind, RowKind::Dir { .. }))
+        .map(|r| r.path)
+        .collect()
+}
+
 pub fn build(changes: &[FileChange], collapsed: &HashSet<String>) -> Vec<Row> {
     let mut root = Dir::default();
     for (i, c) in changes.iter().enumerate() {
@@ -122,6 +131,12 @@ mod tests {
         assert_eq!(rows[6].kind, RowKind::File(1));
         assert_eq!(rows[2].path, "src/ui/a.rs");
         assert_eq!(rows[4].path, "x/y/z");
+        let dirs = all_dirs(&changes);
+        assert_eq!(
+            dirs,
+            HashSet::from(["src".into(), "src/ui".into(), "x/y/z".into()])
+        );
+        assert_eq!(build(&changes, &dirs).len(), 3); // src, x/y/z, README.md
     }
 
     #[test]

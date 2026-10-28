@@ -675,6 +675,9 @@ impl App {
             Action::Bottom => self.move_by(isize::MAX / 2, false),
             Action::Left | Action::Right => self.left_right(action == Action::Right),
             Action::Toggle => self.toggle(),
+            Action::CollapseRecursive | Action::ExpandRecursive => {
+                self.set_collapsed_recursive(action == Action::CollapseRecursive)
+            }
             Action::NextHunk | Action::PrevHunk => self.jump_hunk(action == Action::NextHunk),
             Action::Escape => match self.focus {
                 Pane::Diff => {
@@ -852,6 +855,39 @@ impl App {
             }
             Pane::Commits => {}
         }
+    }
+
+    /// Collapses or expands the directory at the cursor (or containing the file at the
+    /// cursor) together with all of its subdirectories.
+    fn set_collapsed_recursive(&mut self, collapse: bool) {
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        let Some(row) = st.rows.get(st.tree_cursor) else {
+            return;
+        };
+        let dir_row = match row.kind {
+            RowKind::Dir { .. } => Some(st.tree_cursor),
+            RowKind::File(_) => (0..st.tree_cursor)
+                .rev()
+                .find(|&r| st.rows[r].depth < row.depth),
+        };
+        let Some(dir_row) = dir_row else { return };
+        let dir = st.rows[dir_row].path.clone();
+        let prefix = format!("{dir}/");
+        let affected = tree::all_dirs(st.files())
+            .into_iter()
+            .filter(|d| *d == dir || d.starts_with(&prefix));
+        if collapse {
+            st.collapsed.extend(affected);
+            // The directory row stays visible; anything below it is now hidden.
+            st.tree_cursor = dir_row;
+        } else {
+            for d in affected {
+                st.collapsed.remove(&d);
+            }
+        }
+        st.rebuild_rows();
     }
 
     fn toggle(&mut self) {

@@ -48,6 +48,8 @@ pub enum Action {
     Left,
     Right,
     Toggle,
+    CollapseRecursive,
+    ExpandRecursive,
     NextHunk,
     PrevHunk,
     Escape,
@@ -184,6 +186,20 @@ pub const BINDINGS: &[Binding] = &[
     b(Tree, &["l", "Right"], A::Right, "l  →", "Expand directory"),
     b(
         Tree,
+        &["H", "S-Left"],
+        A::CollapseRecursive,
+        "H  Shift-←",
+        "Collapse directory and all subdirectories",
+    ),
+    b(
+        Tree,
+        &["L", "S-Right"],
+        A::ExpandRecursive,
+        "L  Shift-→",
+        "Expand directory and all subdirectories",
+    ),
+    b(
+        Tree,
         &["Enter", "Space"],
         A::Toggle,
         "Enter  Space",
@@ -228,17 +244,20 @@ pub const MOUSE_HELP: &[(&str, &str)] = &[
 /// Ctrl+char as "C-x", other keys by name ("Tab", "S-Tab", "Down", "Enter").
 pub fn key_name(ev: &KeyEvent) -> Option<String> {
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
     Some(match ev.code {
         KeyCode::Char(c) if ctrl => format!("C-{}", c.to_ascii_lowercase()),
         KeyCode::Char(' ') => "Space".into(),
         KeyCode::Char(c) => c.to_string(),
-        KeyCode::Tab if ev.modifiers.contains(KeyModifiers::SHIFT) => "S-Tab".into(),
+        KeyCode::Tab if shift => "S-Tab".into(),
         KeyCode::BackTab => "S-Tab".into(),
         KeyCode::Tab => "Tab".into(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Esc".into(),
         KeyCode::Up => "Up".into(),
         KeyCode::Down => "Down".into(),
+        KeyCode::Left if shift => "S-Left".into(),
+        KeyCode::Right if shift => "S-Right".into(),
         KeyCode::Left => "Left".into(),
         KeyCode::Right => "Right".into(),
         KeyCode::PageUp => "PageUp".into(),
@@ -293,6 +312,10 @@ mod tests {
         assert!(matches!(
             lookup("j", Scope::Diff),
             Lookup::Action(Action::NextHunk)
+        ));
+        assert!(matches!(
+            lookup("S-Left", Scope::Tree),
+            Lookup::Action(Action::CollapseRecursive)
         ));
         assert!(matches!(
             lookup("Down", Scope::Diff),
