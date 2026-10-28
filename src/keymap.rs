@@ -191,8 +191,22 @@ pub const BINDINGS: &[Binding] = &[
     ),
     b(Diff, &["h", "Left"], A::Left, "h  ←", "Scroll left"),
     b(Diff, &["l", "Right"], A::Right, "l  →", "Scroll right"),
-    b(Diff, &["J", "}"], A::NextHunk, "J  }", "Next hunk"),
-    b(Diff, &["K", "{"], A::PrevHunk, "K  {", "Previous hunk"),
+    b(
+        Diff,
+        &["j", "}"],
+        A::NextHunk,
+        "j  }",
+        "Next hunk (continues into next file)",
+    ),
+    b(Diff, &["Down"], A::Down, "↓", "Next line"),
+    b(
+        Diff,
+        &["k", "{"],
+        A::PrevHunk,
+        "k  {",
+        "Previous hunk (continues into previous file)",
+    ),
+    b(Diff, &["Up"], A::Up, "↑", "Previous line"),
     b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
     b(
         Commits,
@@ -277,8 +291,16 @@ mod tests {
             Lookup::Action(Action::NextWorktree)
         ));
         assert!(matches!(
-            lookup("J", Scope::Diff),
+            lookup("j", Scope::Diff),
             Lookup::Action(Action::NextHunk)
+        ));
+        assert!(matches!(
+            lookup("Down", Scope::Diff),
+            Lookup::Action(Action::Down)
+        ));
+        assert!(matches!(
+            lookup("j", Scope::Tree),
+            Lookup::Action(Action::Down)
         ));
         assert!(matches!(
             lookup("g t", Scope::Diff),
