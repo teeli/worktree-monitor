@@ -651,8 +651,12 @@ impl App {
             Action::Worktree(i) => self.switch_worktree(i),
             Action::PrevWorktree if n > 0 => self.switch_worktree((self.active + n - 1) % n),
             Action::NextWorktree if n > 0 => self.switch_worktree((self.active + 1) % n),
-            Action::NextFile => self.step_file(true),
-            Action::PrevFile => self.step_file(false),
+            Action::NextFile => {
+                self.step_file(true);
+            }
+            Action::PrevFile => {
+                self.step_file(false);
+            }
             Action::NextCommit => self.step_commit(true),
             Action::PrevCommit => self.step_commit(false),
             Action::CopyRelative => self.copy_path(false),
@@ -776,10 +780,11 @@ impl App {
         self.maybe_load_more();
     }
 
-    fn step_file(&mut self, forward: bool) {
+    /// Selects the next/previous file in the tree. Returns whether one was found.
+    fn step_file(&mut self, forward: bool) -> bool {
         let active = self.active;
         let Some(st) = self.wts.get(active) else {
-            return;
+            return false;
         };
         let cur = st.tree_cursor;
         let found = if forward {
@@ -793,6 +798,7 @@ impl App {
             let st = &mut self.wts[active];
             ensure_visible(&mut st.tree_offset, st.tree_cursor, h);
         }
+        found.is_some()
     }
 
     fn left_right(&mut self, right: bool) {
@@ -885,11 +891,20 @@ impl App {
         } else {
             hunks.into_iter().rev().find(|&h| h < cur.saturating_sub(1))
         };
+        // Hunk jumps select the hunk's first line; the selection (unlike the scroll
+        // offset, which rendering clamps) reliably tracks where we are.
         if let Some(h) = target {
             st.diff_offset = h;
-            if st.diff_sel.is_some() {
-                st.diff_sel = Some((h + 1).min(st.diff.lines.len().saturating_sub(1)));
-            }
+            st.diff_sel = Some((h + 1).min(st.diff.lines.len().saturating_sub(1)));
+            return;
+        }
+        // Past the last/first hunk: continue at the top of the next / bottom of the previous file.
+        if self.step_file(forward) {
+            let st = &mut self.wts[self.active];
+            // Positions beyond the end are clamped once the new diff has loaded.
+            let pos = if forward { 0 } else { usize::MAX };
+            st.diff_offset = pos;
+            st.diff_sel = Some(pos);
         }
     }
 
