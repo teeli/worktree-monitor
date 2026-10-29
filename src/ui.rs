@@ -345,17 +345,25 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let gutter = format!("{} {} ", num(l.old), num(l.new));
             let text = skip_cols(&l.text, st.diff_hscroll);
-            let mut spans = vec![Span::styled(gutter, theme.dim)];
+            let selected = st.diff_sel == Some(i);
+            let gutter_style = if selected {
+                theme.gutter_sel
+            } else {
+                theme.dim
+            };
+            let mut spans = vec![Span::styled(gutter, gutter_style)];
             spans.extend(fit_spans(
                 vec![Span::styled(marker, style), Span::styled(text, style)],
                 text_w + 1,
             ));
-            let line = Line::from(spans);
-            if st.diff_sel == Some(i) {
-                line.style(sel_style)
-            } else {
-                line
+            if selected {
+                // Span styles carry their own bg (e.g. Dracula), so patch the
+                // highlight onto every span, gutter included.
+                for span in &mut spans {
+                    span.style = span.style.patch(sel_style);
+                }
             }
+            Line::from(spans)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
