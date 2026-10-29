@@ -26,6 +26,9 @@ pub struct Theme {
     /// Selected diff line: background only, so diff colors stay intact.
     pub diff_sel: Style,
     pub diff_sel_inactive: Style,
+    /// Line-number gutter of the selected diff line (foreground only).
+    pub gutter_sel: Style,
+    pub gutter_sel_inactive: Style,
     pub add: Style,
     pub del: Style,
     pub hunk: Style,
@@ -68,6 +71,8 @@ impl Theme {
             // 256-color grays: reliably a little lighter than a dark background.
             diff_sel: Style::new().bg(Color::Indexed(238)),
             diff_sel_inactive: Style::new().bg(Color::Indexed(236)),
+            gutter_sel: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            gutter_sel_inactive: Style::new().fg(Color::Gray),
             add: s.fg(Color::Green),
             del: s.fg(Color::Red),
             hunk: s.fg(Color::Cyan),
@@ -113,6 +118,8 @@ impl Theme {
             cursor_inactive: Style::new().bg(Color::Rgb(0x34, 0x37, 0x46)),
             diff_sel: Style::new().bg(LINE),
             diff_sel_inactive: Style::new().bg(Color::Rgb(0x34, 0x37, 0x46)),
+            gutter_sel: Style::new().fg(FG).add_modifier(Modifier::BOLD),
+            gutter_sel_inactive: Style::new().fg(COMMENT),
             add: s.fg(GREEN),
             del: s.fg(RED),
             hunk: s.fg(PURPLE),
