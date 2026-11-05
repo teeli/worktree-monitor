@@ -102,6 +102,17 @@ fn pane_block<'a>(title: String, focused: bool, theme: &Theme) -> Block<'a> {
         .title(Span::styled(title, theme.title))
 }
 
+/// Patches `style` onto every span: span styles may carry their own bg
+/// (e.g. Dracula), which would otherwise mask a line-level highlight.
+fn patch_row(spans: Vec<Span<'_>>, style: Style) -> Line<'_> {
+    Line::from(
+        spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.patch(style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn cursor_style(focused: bool, theme: &Theme) -> Style {
     if focused {
         theme.cursor
@@ -256,11 +267,11 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
             }
-            let line = Line::from(fit_spans(spans, w));
+            let spans = fit_spans(spans, w);
             if i == st.tree_cursor {
-                line.style(cursor_style(focused, &theme))
+                patch_row(spans, cursor_style(focused, &theme))
             } else {
-                line
+                Line::from(spans)
             }
         })
         .collect();
@@ -321,11 +332,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let gutter_w = num_w * 2 + 2;
     let text_w = (inner.width as usize).saturating_sub(gutter_w + 1);
     let num = |n: Option<u32>| n.map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
-    let sel_style = if focused {
-        theme.diff_sel
-    } else {
-        theme.diff_sel_inactive
-    };
+    let sel_style = theme.diff_sel;
 
     let lines: Vec<Line> = st
         .diff
@@ -359,12 +366,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             // Span styles carry their own bg (e.g. Dracula), so the selection
             // is patched onto the finished row (gutter and padding included).
             let row_style = if selected { sel_style } else { Style::new() };
-            Line::from(
-                spans
-                    .into_iter()
-                    .map(|s| Span::styled(s.content, s.style.patch(row_style)))
-                    .collect::<Vec<_>>(),
-            )
+            patch_row(spans, row_style)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -439,11 +441,17 @@ fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
                 s.push(Span::styled(c.subject.clone(), theme.base));
                 s
             };
-            let line = Line::from(fit_spans(spans, w));
+            let spans = fit_spans(spans, w);
+            let is_selected = match selected_sha {
+                None => i == 0,
+                Some(sha) => i > 0 && st.commits[i - 1].sha == sha,
+            };
             if i == st.commit_cursor {
-                line.style(cursor_style(focused, &theme))
+                patch_row(spans, cursor_style(focused, &theme))
+            } else if is_selected {
+                patch_row(spans, theme.diff_sel)
             } else {
-                line
+                Line::from(spans)
             }
         })
         .collect();
