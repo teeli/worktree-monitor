@@ -239,7 +239,6 @@ def main():
         down = "\x1b[B"
         keys = [
             ("n" * 4, 0.6),  # step through files to src/server.rs
-            ("\t", 0.3),  # focus diff
             ("j", 0.3),  # jump to the hunk
             (down * 6, 0.3),  # select the `tokens: TokenStore` line
             ("y", 0.5),  # copy path:line (shows toast)

@@ -1,8 +1,8 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
-use crate::app::{App, Pane};
+use crate::app::App;
 use crate::diff::LineKind;
-use crate::keymap::{BINDINGS, MOUSE_HELP, Scope};
+use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
 use crate::theme::Theme;
 use crate::tree::RowKind;
 use ratatui::Frame;
@@ -91,14 +91,10 @@ fn skip_cols(s: &str, skip: usize) -> &str {
     ""
 }
 
-fn pane_block<'a>(title: String, focused: bool, theme: &Theme) -> Block<'a> {
+fn pane_block<'a>(title: String, theme: &Theme) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(if focused {
-            theme.border_focused
-        } else {
-            theme.border
-        })
+        .border_style(theme.border)
         .title(Span::styled(title, theme.title))
 }
 
@@ -111,14 +107,6 @@ fn patch_row(spans: Vec<Span<'_>>, style: Style) -> Line<'_> {
             .map(|s| Span::styled(s.content, s.style.patch(style)))
             .collect::<Vec<_>>(),
     )
-}
-
-fn cursor_style(focused: bool, theme: &Theme) -> Style {
-    if focused {
-        theme.cursor
-    } else {
-        theme.cursor_inactive
-    }
 }
 
 fn message(f: &mut Frame, area: Rect, text: &str, style: Style) {
@@ -212,7 +200,6 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Pane::Tree;
     let theme = app.theme.clone();
     let Some(st) = app.wts.get_mut(app.active) else {
         return;
@@ -221,7 +208,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
         Some(c) => format!(" Files @ {} · {} ", c.short, st.commit_files.len()),
         None => format!(" Changes · {} ", st.changes.len()),
     };
-    let block = pane_block(title, focused, &theme);
+    let block = pane_block(title, &theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hit.tree = inner;
@@ -269,7 +256,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let spans = fit_spans(spans, w);
             if i == st.tree_cursor {
-                patch_row(spans, cursor_style(focused, &theme))
+                patch_row(spans, theme.cursor)
             } else {
                 Line::from(spans)
             }
@@ -279,7 +266,6 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Pane::Diff;
     let theme = app.theme.clone();
     let Some(st) = app.wts.get_mut(app.active) else {
         return;
@@ -295,7 +281,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         }
         None => " Diff ".to_string(),
     };
-    let block = pane_block(title, focused, &theme);
+    let block = pane_block(title, &theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hit.diff = inner;
@@ -353,10 +339,10 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             let gutter = format!("{} {} ", num(l.old), num(l.new));
             let text = skip_cols(&l.text, st.diff_hscroll);
             let selected = st.diff_sel == Some(i);
-            let gutter_style = match (selected, focused) {
-                (true, true) => theme.gutter_sel,
-                (true, false) => theme.gutter_sel_inactive,
-                (false, _) => theme.dim,
+            let gutter_style = if selected {
+                theme.gutter_sel
+            } else {
+                theme.dim
             };
             let mut spans = vec![Span::styled(gutter, gutter_style)];
             spans.extend(fit_spans(
@@ -389,13 +375,12 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Pane::Commits;
     let theme = app.theme.clone();
     let Some(st) = app.wts.get_mut(app.active) else {
         return;
     };
     let title = format!(" Commits · {} ", st.info.label());
-    let block = pane_block(title, focused, &theme);
+    let block = pane_block(title, &theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hit.commits = inner;
@@ -447,7 +432,7 @@ fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
                 Some(sha) => i > 0 && st.commits[i - 1].sha == sha,
             };
             if i == st.commit_cursor {
-                patch_row(spans, cursor_style(focused, &theme))
+                patch_row(spans, theme.cursor)
             } else if is_selected {
                 patch_row(spans, theme.diff_sel)
             } else {
@@ -460,10 +445,7 @@ fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let mut left = vec![
-        Span::styled(format!(" {} ", app.focus.name()), theme.status_pill),
-        Span::raw(" "),
-    ];
+    let mut left = vec![];
     if let Some(st) = app.active() {
         left.push(Span::styled(home_relative(&st.info.path), theme.base));
         if let Some(c) = &st.commit {
@@ -487,16 +469,16 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Line::from(right), r);
 }
 
-fn help_lines<'a>(scopes: &[Scope], theme: &Theme, mouse: bool) -> Vec<Line<'a>> {
+fn help_lines<'a>(sections: &[Section], theme: &Theme, mouse: bool) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
-    for &scope in scopes {
+    for &section in sections {
         if !lines.is_empty() {
             lines.push(Line::raw(""));
         }
-        lines.push(Line::styled(scope.title(), theme.title));
+        lines.push(Line::styled(section.title(), theme.title));
         for b in BINDINGS
             .iter()
-            .filter(|b| b.scope == scope && !b.label.is_empty())
+            .filter(|b| b.section == section && !b.label.is_empty())
         {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<14}", b.label), theme.sha),
@@ -519,11 +501,16 @@ fn help_lines<'a>(scopes: &[Scope], theme: &Theme, mouse: bool) -> Vec<Line<'a>>
 
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
-    let all = [Scope::Global, Scope::Tree, Scope::Diff, Scope::Commits];
+    let all = [
+        Section::General,
+        Section::Worktrees,
+        Section::Diff,
+        Section::Tree,
+    ];
     let width_of = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let (gl, rest) = (
-        help_lines(&all[..1], theme, false),
-        help_lines(&all[1..], theme, true),
+        help_lines(&all[..2], theme, false),
+        help_lines(&all[2..], theme, true),
     );
     // Two columns when they fit side by side, otherwise one scrollable column.
     let cols = if width_of(&gl) + width_of(&rest) + 7 <= area.width {
@@ -551,7 +538,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(theme.border_focused)
+        .border_style(theme.popup_border)
         .style(theme.base)
         .title(Span::styled(title, theme.title));
     let inner = block.inner(popup);

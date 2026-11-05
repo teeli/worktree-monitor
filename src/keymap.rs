@@ -2,21 +2,22 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Help popup grouping; has no effect on dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Global,
-    Tree,
+pub enum Section {
+    General,
+    Worktrees,
     Diff,
-    Commits,
+    Tree,
 }
 
-impl Scope {
+impl Section {
     pub fn title(self) -> &'static str {
         match self {
-            Scope::Global => "Global",
-            Scope::Tree => "File tree",
-            Scope::Diff => "Diff",
-            Scope::Commits => "Commits",
+            Section::General => "General",
+            Section::Worktrees => "Worktrees & history",
+            Section::Diff => "Diff",
+            Section::Tree => "File tree",
         }
     }
 }
@@ -25,8 +26,6 @@ impl Scope {
 pub enum Action {
     Quit,
     Help,
-    FocusNext,
-    FocusPrev,
     Worktree(usize),
     PrevWorktree,
     NextWorktree,
@@ -49,6 +48,8 @@ pub enum Action {
     Right,
     Toggle,
     CollapseRecursive,
+    FoldAll,
+    UnfoldAll,
     ExpandRecursive,
     NextHunk,
     PrevHunk,
@@ -56,7 +57,7 @@ pub enum Action {
 }
 
 pub struct Binding {
-    pub scope: Scope,
+    pub section: Section,
     /// Key sequences: space-separated [`key_name`]s, e.g. "g t".
     pub keys: &'static [&'static str],
     pub action: Action,
@@ -66,14 +67,14 @@ pub struct Binding {
 }
 
 const fn b(
-    scope: Scope,
+    section: Section,
     keys: &'static [&'static str],
     action: Action,
     label: &'static str,
     desc: &'static str,
 ) -> Binding {
     Binding {
-        scope,
+        section,
         keys,
         action,
         label,
@@ -82,108 +83,127 @@ const fn b(
 }
 
 use Action as A;
-use Scope::{Commits, Diff, Global, Tree};
+use Section::{Diff, General, Tree, Worktrees};
 
 pub const BINDINGS: &[Binding] = &[
-    b(Global, &["q", "C-c"], A::Quit, "q  Ctrl-c", "Quit"),
-    b(Global, &["?"], A::Help, "?", "Toggle this help"),
-    b(Global, &["Tab"], A::FocusNext, "Tab", "Focus next pane"),
+    b(General, &["q", "C-c"], A::Quit, "q  Ctrl-c", "Quit"),
+    b(General, &["?"], A::Help, "?", "Toggle this help"),
+    b(General, &["r"], A::Refresh, "r", "Force refresh"),
     b(
-        Global,
-        &["S-Tab"],
-        A::FocusPrev,
-        "Shift-Tab",
-        "Focus previous pane",
-    ),
-    b(
-        Global,
-        &["1"],
-        A::Worktree(0),
-        "1 … 9",
-        "Switch to worktree N",
-    ),
-    b(Global, &["2"], A::Worktree(1), "", ""),
-    b(Global, &["3"], A::Worktree(2), "", ""),
-    b(Global, &["4"], A::Worktree(3), "", ""),
-    b(Global, &["5"], A::Worktree(4), "", ""),
-    b(Global, &["6"], A::Worktree(5), "", ""),
-    b(Global, &["7"], A::Worktree(6), "", ""),
-    b(Global, &["8"], A::Worktree(7), "", ""),
-    b(Global, &["9"], A::Worktree(8), "", ""),
-    b(
-        Global,
-        &[",", "[", "g T"],
-        A::PrevWorktree,
-        ",  [  gT",
-        "Previous worktree",
-    ),
-    b(
-        Global,
-        &[".", "]", "g t"],
-        A::NextWorktree,
-        ".  ]  gt",
-        "Next worktree",
-    ),
-    b(Global, &["n"], A::NextFile, "n", "Next file"),
-    b(Global, &["p"], A::PrevFile, "p", "Previous file"),
-    b(
-        Global,
-        &["N"],
-        A::NextCommit,
-        "N",
-        "Show next (older) commit",
-    ),
-    b(
-        Global,
-        &["P"],
-        A::PrevCommit,
-        "P",
-        "Show previous (newer) commit / working tree",
-    ),
-    b(
-        Global,
+        General,
         &["y"],
         A::CopyRelative,
         "y",
         "Copy relative path (with :line if selected)",
     ),
     b(
-        Global,
+        General,
         &["Y"],
         A::CopyAbsolute,
         "Y",
         "Copy absolute path (with :line if selected)",
     ),
-    b(Global, &["r"], A::Refresh, "r", "Force refresh"),
-    // Shared movement, interpreted per pane.
-    b(Global, &["j", "Down"], A::Down, "j  ↓", "Move down"),
-    b(Global, &["k", "Up"], A::Up, "k  ↑", "Move up"),
-    b(Global, &["C-d"], A::HalfDown, "Ctrl-d", "Half page down"),
-    b(Global, &["C-u"], A::HalfUp, "Ctrl-u", "Half page up"),
     b(
-        Global,
+        Worktrees,
+        &["1"],
+        A::Worktree(0),
+        "1 … 9",
+        "Switch to worktree N",
+    ),
+    b(Worktrees, &["2"], A::Worktree(1), "", ""),
+    b(Worktrees, &["3"], A::Worktree(2), "", ""),
+    b(Worktrees, &["4"], A::Worktree(3), "", ""),
+    b(Worktrees, &["5"], A::Worktree(4), "", ""),
+    b(Worktrees, &["6"], A::Worktree(5), "", ""),
+    b(Worktrees, &["7"], A::Worktree(6), "", ""),
+    b(Worktrees, &["8"], A::Worktree(7), "", ""),
+    b(Worktrees, &["9"], A::Worktree(8), "", ""),
+    b(
+        Worktrees,
+        &[",", "[", "g T"],
+        A::PrevWorktree,
+        ",  [  gT",
+        "Previous worktree",
+    ),
+    b(
+        Worktrees,
+        &[".", "]", "g t"],
+        A::NextWorktree,
+        ".  ]  gt",
+        "Next worktree",
+    ),
+    b(
+        Worktrees,
+        &["n"],
+        A::NextFile,
+        "n",
+        "Next file (or collapsed directory)",
+    ),
+    b(
+        Worktrees,
+        &["p"],
+        A::PrevFile,
+        "p",
+        "Previous file (or collapsed directory)",
+    ),
+    b(
+        Worktrees,
+        &["N"],
+        A::NextCommit,
+        "N",
+        "Show next (older) commit",
+    ),
+    b(
+        Worktrees,
+        &["P"],
+        A::PrevCommit,
+        "P",
+        "Show previous (newer) commit / working tree",
+    ),
+    b(
+        Diff,
+        &["j", "}"],
+        A::NextHunk,
+        "j  }",
+        "Next hunk (continues into next file)",
+    ),
+    b(
+        Diff,
+        &["k", "{"],
+        A::PrevHunk,
+        "k  {",
+        "Previous hunk (continues into previous file)",
+    ),
+    b(Diff, &["Down"], A::Down, "↓", "Next line"),
+    b(Diff, &["Up"], A::Up, "↑", "Previous line"),
+    b(Diff, &["h", "Left"], A::Left, "h  ←", "Scroll left"),
+    b(Diff, &["l", "Right"], A::Right, "l  →", "Scroll right"),
+    b(Diff, &["C-d"], A::HalfDown, "Ctrl-d", "Half page down"),
+    b(Diff, &["C-u"], A::HalfUp, "Ctrl-u", "Half page up"),
+    b(
+        Diff,
         &["PageDown", "C-f"],
         A::PageDown,
         "PgDn  Ctrl-f",
         "Page down",
     ),
     b(
-        Global,
+        Diff,
         &["PageUp", "C-b"],
         A::PageUp,
         "PgUp  Ctrl-b",
         "Page up",
     ),
-    b(Global, &["g g", "Home"], A::Top, "gg  Home", "Go to top"),
-    b(Global, &["G", "End"], A::Bottom, "G  End", "Go to bottom"),
+    b(Diff, &["g g", "Home"], A::Top, "gg  Home", "Go to top"),
+    b(Diff, &["G", "End"], A::Bottom, "G  End", "Go to bottom"),
+    b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
     b(
         Tree,
-        &["h", "Left"],
-        A::Left,
-        "h  ←",
-        "Collapse directory / go to parent",
+        &["Enter", "Space"],
+        A::Toggle,
+        "Enter  Space",
+        "Toggle directory (of the current file)",
     ),
-    b(Tree, &["l", "Right"], A::Right, "l  →", "Expand directory"),
     b(
         Tree,
         &["H", "S-Left"],
@@ -198,40 +218,8 @@ pub const BINDINGS: &[Binding] = &[
         "L  Shift-→",
         "Expand directory and all subdirectories",
     ),
-    b(
-        Tree,
-        &["Enter", "Space"],
-        A::Toggle,
-        "Enter  Space",
-        "Toggle directory",
-    ),
-    b(Diff, &["h", "Left"], A::Left, "h  ←", "Scroll left"),
-    b(Diff, &["l", "Right"], A::Right, "l  →", "Scroll right"),
-    b(
-        Diff,
-        &["j", "}"],
-        A::NextHunk,
-        "j  }",
-        "Next hunk (continues into next file)",
-    ),
-    b(Diff, &["Down"], A::Down, "↓", "Next line"),
-    b(
-        Diff,
-        &["k", "{"],
-        A::PrevHunk,
-        "k  {",
-        "Previous hunk (continues into previous file)",
-    ),
-    b(Diff, &["Up"], A::Up, "↑", "Previous line"),
-    b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
-    b(
-        Commits,
-        &["Enter", "Space"],
-        A::Toggle,
-        "Enter  Space",
-        "Show commit (top row: working tree)",
-    ),
-    b(Commits, &["Esc"], A::Escape, "Esc", "Back to working tree"),
+    b(Tree, &["z"], A::FoldAll, "z", "Collapse all directories"),
+    b(Tree, &["Z"], A::UnfoldAll, "Z", "Expand all directories"),
 ];
 
 /// Mouse help shown alongside key bindings.
@@ -275,15 +263,15 @@ pub enum Lookup {
     None,
 }
 
-/// Resolves a key sequence; pane-specific bindings take precedence over global ones.
-pub fn lookup(seq: &str, pane: Scope) -> Lookup {
-    let scoped = BINDINGS.iter().filter(|b| b.scope == pane);
-    let global = BINDINGS.iter().filter(|b| b.scope == Scope::Global);
-    let candidates = || scoped.clone().chain(global.clone());
-    if let Some(b) = candidates().find(|b| b.keys.contains(&seq)) {
+/// Resolves a key sequence.
+pub fn lookup(seq: &str) -> Lookup {
+    if let Some(b) = BINDINGS.iter().find(|b| b.keys.contains(&seq)) {
         return Lookup::Action(b.action);
     }
-    if candidates().any(|b| b.keys.iter().any(|k| k.starts_with(&format!("{seq} ")))) {
+    if BINDINGS
+        .iter()
+        .any(|b| b.keys.iter().any(|k| k.starts_with(&format!("{seq} "))))
+    {
         return Lookup::Pending;
     }
     Lookup::None
@@ -294,49 +282,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_scoped_and_sequences() {
+    fn resolves_sequences() {
+        assert!(matches!(lookup("h"), Lookup::Action(Action::Left)));
+        assert!(matches!(lookup("Enter"), Lookup::Action(Action::Toggle)));
+        assert!(matches!(lookup("g"), Lookup::Pending));
+        assert!(matches!(lookup("."), Lookup::Action(Action::NextWorktree)));
+        assert!(matches!(lookup("j"), Lookup::Action(Action::NextHunk)));
         assert!(matches!(
-            lookup("h", Scope::Tree),
-            Lookup::Action(Action::Left)
-        ));
-        assert!(matches!(lookup("h", Scope::Commits), Lookup::None));
-        assert!(matches!(
-            lookup("Enter", Scope::Commits),
-            Lookup::Action(Action::Toggle)
-        ));
-        assert!(matches!(lookup("g", Scope::Diff), Lookup::Pending));
-        assert!(matches!(
-            lookup(".", Scope::Commits),
-            Lookup::Action(Action::NextWorktree)
-        ));
-        assert!(matches!(
-            lookup("j", Scope::Diff),
-            Lookup::Action(Action::NextHunk)
-        ));
-        assert!(matches!(
-            lookup("S-Left", Scope::Tree),
+            lookup("S-Left"),
             Lookup::Action(Action::CollapseRecursive)
         ));
+        assert!(matches!(lookup("Down"), Lookup::Action(Action::Down)));
         assert!(matches!(
-            lookup("Down", Scope::Diff),
-            Lookup::Action(Action::Down)
-        ));
-        assert!(matches!(
-            lookup("j", Scope::Tree),
-            Lookup::Action(Action::Down)
-        ));
-        assert!(matches!(
-            lookup("g t", Scope::Diff),
+            lookup("g t"),
             Lookup::Action(Action::NextWorktree)
         ));
-        assert!(matches!(
-            lookup("g g", Scope::Tree),
-            Lookup::Action(Action::Top)
-        ));
-        assert!(matches!(lookup("E", Scope::Tree), Lookup::None));
-        assert!(matches!(
-            lookup("3", Scope::Tree),
-            Lookup::Action(Action::Worktree(2))
-        ));
+        assert!(matches!(lookup("g g"), Lookup::Action(Action::Top)));
+        assert!(matches!(lookup("z"), Lookup::Action(Action::FoldAll)));
+        assert!(matches!(lookup("Z"), Lookup::Action(Action::UnfoldAll)));
+        assert!(matches!(lookup("Tab"), Lookup::None));
+        assert!(matches!(lookup("E"), Lookup::None));
+        assert!(matches!(lookup("3"), Lookup::Action(Action::Worktree(2))));
     }
 }

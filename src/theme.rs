@@ -14,20 +14,16 @@ pub struct Theme {
     pub base: Style,
     pub dim: Style,
     pub border: Style,
-    pub border_focused: Style,
+    pub popup_border: Style,
     pub title: Style,
     pub tab: Style,
     pub tab_active: Style,
     pub badge: Style,
-    /// Cursor row in the focused pane.
     pub cursor: Style,
-    /// Cursor row in an unfocused pane.
-    pub cursor_inactive: Style,
     /// Selected diff line: background only, so diff colors stay intact.
     pub diff_sel: Style,
     /// Line-number gutter of the selected diff line (foreground only).
     pub gutter_sel: Style,
-    pub gutter_sel_inactive: Style,
     pub add: Style,
     pub del: Style,
     pub hunk: Style,
@@ -39,7 +35,6 @@ pub struct Theme {
     pub untracked: Style,
     pub renamed: Style,
     pub conflict: Style,
-    pub status_pill: Style,
     pub error: Style,
 }
 
@@ -57,7 +52,7 @@ impl Theme {
             base: s,
             dim: s.fg(Color::DarkGray),
             border: s.fg(Color::DarkGray),
-            border_focused: s.fg(Color::Cyan),
+            popup_border: s.fg(Color::Cyan),
             title: s.add_modifier(Modifier::BOLD),
             tab: s,
             tab_active: s
@@ -66,11 +61,9 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             badge: s.fg(Color::Yellow),
             cursor: s.add_modifier(Modifier::REVERSED),
-            cursor_inactive: s.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             // 256-color grays: reliably a little lighter than a dark background.
             diff_sel: Style::new().bg(Color::Indexed(238)),
             gutter_sel: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            gutter_sel_inactive: Style::new().fg(Color::Gray),
             add: s.fg(Color::Green),
             del: s.fg(Color::Red),
             hunk: s.fg(Color::Cyan),
@@ -82,10 +75,6 @@ impl Theme {
             untracked: s.fg(Color::Magenta),
             renamed: s.fg(Color::Cyan),
             conflict: s.fg(Color::Red).add_modifier(Modifier::BOLD),
-            status_pill: s
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
             error: s.fg(Color::Red),
         }
     }
@@ -107,16 +96,14 @@ impl Theme {
             base: s,
             dim: s.fg(COMMENT),
             border: s.fg(COMMENT),
-            border_focused: s.fg(PURPLE),
+            popup_border: s.fg(PURPLE),
             title: s.fg(FG).add_modifier(Modifier::BOLD),
             tab: s.fg(FG),
             tab_active: s.fg(BG).bg(PURPLE).add_modifier(Modifier::BOLD),
             badge: s.fg(ORANGE),
             cursor: Style::new().bg(LINE).add_modifier(Modifier::BOLD),
-            cursor_inactive: Style::new().bg(LINE).add_modifier(Modifier::BOLD),
             diff_sel: Style::new().bg(LINE),
             gutter_sel: Style::new().fg(FG).add_modifier(Modifier::BOLD),
-            gutter_sel_inactive: Style::new().fg(COMMENT),
             add: s.fg(GREEN),
             del: s.fg(RED),
             hunk: s.fg(PURPLE),
@@ -128,7 +115,6 @@ impl Theme {
             untracked: s.fg(PINK),
             renamed: s.fg(CYAN),
             conflict: s.fg(RED).add_modifier(Modifier::BOLD),
-            status_pill: s.fg(BG).bg(PINK).add_modifier(Modifier::BOLD),
             error: s.fg(RED),
         }
     }

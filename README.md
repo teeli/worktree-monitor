@@ -42,22 +42,20 @@ Press `?` in the app for the full list.
 
 | Where | Keys | Action |
 |---|---|---|
-| Global | `Tab` / `Shift-Tab` | Focus next / previous pane |
-| | `1`…`9`, `,` / `.` (also `[` `]`, `gT` `gt`) | Switch worktree |
-| | `n` / `p` | Next / previous file |
-| | `N` / `P` | Next (older) / previous (newer) commit |
+| General | `r` · `?` · `q` | Refresh · help · quit |
 | | `y` / `Y` | Copy relative / absolute path (`:line` if a line is selected) |
-| | `j` `k` `↓` `↑`, `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Move / scroll in the focused pane |
-| | `r` · `?` · `q` | Refresh · help · quit |
-| File tree | `h` `l` / `←` `→` | Collapse / expand directory |
-| | `H` `L` / `Shift-←` `Shift-→` | Collapse / expand directory and all subdirectories |
-| | `Enter` / `Space` | Toggle directory |
+| Worktrees & history | `1`…`9`, `,` / `.` (also `[` `]`, `gT` `gt`) | Switch worktree |
+| | `n` / `p` | Next / previous file (or collapsed directory) |
+| | `N` / `P` | Next (older) / previous (newer) commit |
 | Diff | `j` `k` (also `}` `{`) | Next / previous hunk, continuing into adjacent files |
 | | `↓` `↑` | Move the line selection |
 | | `h` `l` / `←` `→` | Scroll horizontally |
+| | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Half page / page / top / bottom |
 | | `Esc` | Clear line selection |
-| Commits | `Enter` / `Space` | Show the commit (top row: working tree) |
-| | `Esc` | Back to working tree |
+| File tree | `Enter` / `Space` | Toggle directory (of the current file) |
+| | `H` / `Shift-←` | Collapse directory and all subdirectories |
+| | `L` / `Shift-→` | Expand directory and all subdirectories |
+| | `z` / `Z` | Collapse / expand all directories |
 
 ## Development
 
