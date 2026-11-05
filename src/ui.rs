@@ -122,6 +122,16 @@ fn clamp_offset(offset: &mut usize, len: usize, height: usize) {
     *offset = (*offset).min(len.saturating_sub(height));
 }
 
+/// Keeps the end of `s` (the interesting part of a path), prefixing `…` when it has to cut.
+fn shorten_left(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - max.saturating_sub(1)).collect();
+    format!("…{tail}")
+}
+
 fn home_relative(p: &std::path::Path) -> String {
     if let Some(home) = std::env::var_os("HOME")
         && let Ok(rel) = p.strip_prefix(&home)
@@ -147,6 +157,13 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let badge = if !w.info.exists() {
                 Some(("✗".to_string(), theme.error))
+            } else if let Some(c) = &w.conflict {
+                let changes = if w.changes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ●{}", w.changes.len())
+                };
+                Some((format!("⚠{}{changes}", c.files.len()), theme.error))
             } else if !w.changes.is_empty() {
                 Some((format!("●{}", w.changes.len()), theme.badge))
             } else {
@@ -445,18 +462,24 @@ fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let mut left = vec![];
+    // Everything after the path; the path is shortened first so the warning stays visible.
+    let mut tail = vec![];
     if let Some(st) = app.active() {
-        left.push(Span::styled(home_relative(&st.info.path), theme.base));
+        if let Some(c) = &st.conflict {
+            tail.push(Span::styled(
+                format!("  ⚠ conflicts with {} ({} files)", c.base, c.files.len()),
+                theme.error,
+            ));
+        }
         if let Some(c) = &st.commit {
-            left.push(Span::styled(
+            tail.push(Span::styled(
                 format!("  @ {} {}", c.short, c.subject),
                 theme.sha,
             ));
         }
     }
     if let Some(p) = &app.pending_keys {
-        left.push(Span::styled(format!("  {p}…"), theme.badge));
+        tail.push(Span::styled(format!("  {p}…"), theme.badge));
     }
     let right = match app.visible_toast() {
         Some((msg, true)) => Span::styled(format!("{msg} "), theme.error),
@@ -465,6 +488,16 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     };
     let right_w = right.width() as u16;
     let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
+    let mut left = vec![];
+    if let Some(st) = app.active() {
+        let tail_w: usize = tail.iter().map(|s| s.width()).sum();
+        let budget = (l.width as usize).saturating_sub(tail_w).max(12);
+        left.push(Span::styled(
+            shorten_left(&home_relative(&st.info.path), budget),
+            theme.base,
+        ));
+    }
+    left.extend(tail);
     f.render_widget(Line::from(fit_spans(left, l.width as usize)), l);
     f.render_widget(Line::from(right), r);
 }
@@ -559,6 +592,12 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortens_from_left() {
+        assert_eq!(shorten_left("abc", 5), "abc");
+        assert_eq!(shorten_left("~/a/b/wt-conflicting", 8), "…licting");
+    }
 
     #[test]
     fn fits_and_pads() {
