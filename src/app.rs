@@ -32,8 +32,11 @@ pub enum AppEvent {
     Input(Event),
     Git(GitResult),
     Fs(Vec<PathBuf>),
-    /// The watcher dropped events; anything may have changed.
-    FsLost,
+    /// The watcher failed and events may have been missed; when it ran out of watches,
+    /// parts of the tree are no longer watched at all.
+    FsError {
+        out_of_watches: bool,
+    },
     Tick,
 }
 
@@ -373,23 +376,31 @@ impl App {
 
     // ---- events -------------------------------------------------------------
 
-    /// Applies an event. Returns whether the screen needs redrawing; events that only queue
-    /// git jobs return `false` (unless they changed state directly, see `dirty`), their
+    /// Applies an event. Returns whether the screen needs redrawing, i.e. whether anything set
+    /// `dirty`. Input and git results always do; events that only queue git jobs don't, the
     /// results redraw once they arrive.
     pub fn handle(&mut self, ev: AppEvent) -> bool {
         match ev {
-            AppEvent::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.on_key(k),
-            AppEvent::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved => return false,
-            AppEvent::Input(Event::Mouse(m)) => self.on_mouse(m),
-            AppEvent::Input(_) => {}
-            AppEvent::Git(res) => self.on_git(res),
-            AppEvent::Fs(paths) => {
-                self.on_fs(paths);
-                return std::mem::take(&mut self.dirty);
+            AppEvent::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved => {}
+            AppEvent::Input(ev) => {
+                self.dirty = true;
+                match ev {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+                    Event::Mouse(m) => self.on_mouse(m),
+                    _ => {}
+                }
             }
-            AppEvent::FsLost => {
+            AppEvent::Git(res) => {
+                self.dirty = true;
+                self.on_git(res);
+            }
+            AppEvent::Fs(paths) => self.on_fs(paths),
+            AppEvent::FsError { out_of_watches } => {
+                if out_of_watches && self.watcher.is_some() {
+                    self.watcher = None;
+                    self.notify("File watching hit the OS limit, polling only".into(), true);
+                }
                 self.refresh_all();
-                return std::mem::take(&mut self.dirty);
             }
             AppEvent::Tick => {
                 self.ticks += 1;
@@ -402,11 +413,9 @@ impl App {
                 } else {
                     self.refresh_status(self.active);
                 }
-                return std::mem::take(&mut self.dirty);
             }
         }
-        self.dirty = false;
-        true
+        std::mem::take(&mut self.dirty)
     }
 
     fn on_fs(&mut self, paths: Vec<PathBuf>) {
@@ -1225,7 +1234,7 @@ enum GitPath {
     /// Index or submodule ref write: only the status of the worktree owning this git
     /// directory (relative to the common directory).
     Status(PathBuf),
-    /// HEAD, refs, packed-refs, config, info/, worktree gitdir: refresh everything.
+    /// HEAD, refs, packed-refs, config(.worktree), info/, worktree gitdir: refresh everything.
     Refs,
 }
 
@@ -1243,7 +1252,14 @@ fn classify_git_path(rel: &Path) -> GitPath {
         [file] if file.to_string_lossy().starts_with("index") => GitPath::Status(owner),
         // `gitdir` is rewritten by `git worktree move`; `config` and `info/` (exclude,
         // sparse-checkout) change what status reports.
-        [file] if is(file, &["HEAD", "packed-refs", "gitdir", "config"]) => GitPath::Refs,
+        [file]
+            if is(
+                file,
+                &["HEAD", "packed-refs", "gitdir", "config", "config.worktree"],
+            ) =>
+        {
+            GitPath::Refs
+        }
         [first, _, ..] if is(first, &["refs", "reftable", "info"]) => GitPath::Refs,
         // A submodule commit or checkout changes the superproject's status.
         [first, rest @ ..] if *first == "modules" => {
@@ -1355,6 +1371,7 @@ mod tests {
             "worktrees/wt/HEAD",
             "worktrees/wt/gitdir",
             "config",
+            "worktrees/wt/config.worktree",
             "info/exclude",
             "worktrees/wt/info/sparse-checkout",
         ] {

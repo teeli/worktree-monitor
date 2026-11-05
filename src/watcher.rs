@@ -21,10 +21,13 @@ pub struct FsWatcher {
 /// falls back to polling instead of silently missing events.
 pub fn watch(paths: &[PathBuf], tx: Sender<AppEvent>) -> anyhow::Result<FsWatcher> {
     let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| {
+        // Queue overflows arrive as path-less rescan events, which the debouncer drops;
+        // the periodic fallback refresh covers those.
         let _ = tx.send(match res {
             Ok(events) => AppEvent::Fs(events.into_iter().map(|e| e.path).collect()),
-            // Events were lost (e.g. queue overflow).
-            Err(_) => AppEvent::FsLost,
+            Err(e) => AppEvent::FsError {
+                out_of_watches: matches!(e.kind, ErrorKind::MaxFilesWatch),
+            },
         });
     })?;
     for p in paths.iter().filter(|p| p.exists()) {
