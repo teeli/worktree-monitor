@@ -16,6 +16,26 @@ use unicode_width::UnicodeWidthChar;
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 12;
+const TREE_MIN_WIDTH: u16 = 20;
+const TREE_MID_WIDTH: u16 = 30;
+const TREE_MAX_WIDTH: u16 = 50;
+const MID_BREAKPOINT: u16 = 100;
+const WIDE_BREAKPOINT: u16 = 120;
+
+/// The file panel is pinned to a fixed width on narrow and medium terminals, with the diff taking
+/// the rest. From `WIDE_BREAKPOINT` on the file panel takes a quarter of the width, capped at `TREE_MAX_WIDTH`.
+fn panel_constraints(width: u16) -> [Constraint; 2] {
+    if width < MID_BREAKPOINT {
+        [Constraint::Length(TREE_MIN_WIDTH), Constraint::Min(0)]
+    } else if width < WIDE_BREAKPOINT {
+        [Constraint::Length(TREE_MID_WIDTH), Constraint::Min(0)]
+    } else {
+        [
+            Constraint::Length((width / 4).min(TREE_MAX_WIDTH)),
+            Constraint::Min(0),
+        ]
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -37,8 +57,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    let [tree, diff] =
-        Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]).areas(main);
+    let [tree, diff] = Layout::horizontal(panel_constraints(main.width)).areas(main);
 
     draw_tabs(f, app, tabs);
     draw_tree(f, app, tree);
@@ -682,6 +701,31 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_split() {
+        let split = |w| {
+            let [tree, diff] =
+                Layout::horizontal(panel_constraints(w)).areas(Rect::new(0, 0, w, 10));
+            (tree.width, diff.width)
+        };
+        assert_eq!(split(40), (20, 20));
+        assert_eq!(split(99), (20, 79));
+        assert_eq!(split(100), (30, 70));
+        assert_eq!(split(119), (30, 89));
+        assert_eq!(split(120), (30, 90));
+        assert_eq!(split(121), (30, 91));
+        assert_eq!(split(199), (49, 150));
+        assert_eq!(split(200), (50, 150));
+        assert_eq!(split(300), (50, 250));
+        let mut prev = 0;
+        for w in MIN_WIDTH..=400 {
+            let (tree, diff) = split(w);
+            assert_eq!(tree + diff, w);
+            assert!(tree >= prev, "tree shrank at width {w}");
+            prev = tree;
+        }
+    }
 
     #[test]
     fn shortens_from_left() {
