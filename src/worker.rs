@@ -153,7 +153,9 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
             }
         }
         Job::Conflicts { wt, base, key } => {
-            let res = git::conflicts_with_base(&wt, &base);
+            // Merge exactly the commits in the memo key, so key and result always agree.
+            let (head, base_sha) = &key;
+            let res = git::conflicts_with_base(&wt, &base, base_sha, head);
             GitResult::Conflicts { wt, key, res }
         }
         Job::CommitFiles { wt, id, commit } => {

@@ -294,7 +294,8 @@ pub fn resolve_base(dir: &Path) -> Option<Base> {
 /// is on the default branch itself.
 pub fn base_for<'a>(branch: Option<&str>, base: &'a str) -> Option<&'a str> {
     let current = branch?;
-    let short_base = base.rsplit('/').next().unwrap_or(base);
+    // `origin/release/v2` tracks the local `release/v2`: strip only the remote name.
+    let short_base = base.split_once('/').map_or(base, |(_, b)| b);
     (current != base && current != short_base).then_some(base)
 }
 
@@ -318,11 +319,23 @@ pub struct Conflict {
 }
 
 /// Dry-run merge via `git merge-tree` (git >= 2.38; never touches the index or working tree).
+/// Merges the commits `base_rev` and `head_rev`; `base` is the branch name for display.
 /// `None` when clean; an error when git cannot tell (e.g. too old, or a transient failure).
-pub fn conflicts_with_base(wt: &Path, base: &str) -> Result<Option<Conflict>> {
+pub fn conflicts_with_base(
+    wt: &Path,
+    base: &str,
+    base_rev: &str,
+    head_rev: &str,
+) -> Result<Option<Conflict>> {
     let out = run(
         wt,
-        &["merge-tree", "--write-tree", "--name-only", base, "HEAD"],
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            base_rev,
+            head_rev,
+        ],
         &[0, 1],
     )?;
     let out = String::from_utf8_lossy(&out);
@@ -594,13 +607,17 @@ mod tests {
 
         std::fs::write(wt.join("a.txt"), "feat\n").unwrap();
         sh(&wt, &["commit", "-q", "-am", "feat change"]);
-        assert_eq!(conflicts_with_base(&wt, &base.name).unwrap(), None);
-        assert!(conflicts_with_base(&wt, "no-such-branch").is_err());
+        let check = |rev: &str| conflicts_with_base(&wt, "master", rev, "HEAD");
+        assert_eq!(check(&base.sha).unwrap(), None);
+        assert!(check("no-such-branch").is_err());
 
         std::fs::write(main.join("a.txt"), "master\n").unwrap();
         sh(&main, &["commit", "-q", "-am", "master change"]);
-        assert_ne!(resolve_base(&main).unwrap().sha, base.sha);
-        let c = conflicts_with_base(&wt, &base.name).unwrap().unwrap();
+        let moved = resolve_base(&main).unwrap();
+        assert_ne!(moved.sha, base.sha);
+        // The exact commits are merged, not whatever the branch points at now.
+        assert_eq!(check(&base.sha).unwrap(), None);
+        let c = check(&moved.sha).unwrap().unwrap();
         assert_eq!(c.base, "master");
         assert_eq!(c.files, vec!["a.txt"]);
 
@@ -615,6 +632,11 @@ mod tests {
         assert_eq!(base_for(Some("main"), "main"), None);
         assert_eq!(base_for(Some("main"), "origin/main"), None);
         assert_eq!(base_for(Some("feat"), "origin/main"), Some("origin/main"));
+        assert_eq!(base_for(Some("release/v2"), "origin/release/v2"), None);
+        assert_eq!(
+            base_for(Some("v2"), "origin/release/v2"),
+            Some("origin/release/v2")
+        );
         assert_eq!(base_for(None, "main"), None);
     }
 

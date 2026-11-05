@@ -2,7 +2,7 @@
 
 use crate::app::AppEvent;
 use anyhow::Context;
-use notify::{RecommendedWatcher, RecursiveMode};
+use notify::{ErrorKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -17,20 +17,24 @@ pub struct FsWatcher {
 }
 
 /// Watches every existing path recursively; missing paths (e.g. a removed worktree directory)
-/// are skipped. Fails if any existing path cannot be watched (e.g. the inotify limit), so the
-/// caller falls back to polling instead of silently missing events.
+/// are skipped. Fails when the OS runs out of watches (e.g. the inotify limit), so the caller
+/// falls back to polling instead of silently missing events.
 pub fn watch(paths: &[PathBuf], tx: Sender<AppEvent>) -> anyhow::Result<FsWatcher> {
     let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| {
-        if let Ok(events) = res {
-            let paths = events.into_iter().map(|e| e.path).collect();
-            let _ = tx.send(AppEvent::Fs(paths));
-        }
+        let _ = tx.send(match res {
+            Ok(events) => AppEvent::Fs(events.into_iter().map(|e| e.path).collect()),
+            // Events were lost (e.g. queue overflow).
+            Err(_) => AppEvent::FsLost,
+        });
     })?;
     for p in paths.iter().filter(|p| p.exists()) {
-        debouncer
-            .watcher()
-            .watch(p, RecursiveMode::Recursive)
-            .with_context(|| format!("watching {}", p.display()))?;
+        if let Err(e) = debouncer.watcher().watch(p, RecursiveMode::Recursive) {
+            // Other errors (e.g. an unreadable subdirectory) only affect part of the tree;
+            // the fallback refresh covers that.
+            if matches!(e.kind, ErrorKind::MaxFilesWatch) {
+                return Err(e).with_context(|| format!("watching {}", p.display()));
+            }
+        }
     }
     Ok(FsWatcher {
         _debouncer: debouncer,

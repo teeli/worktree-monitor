@@ -13,6 +13,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -31,6 +32,8 @@ pub enum AppEvent {
     Input(Event),
     Git(GitResult),
     Fs(Vec<PathBuf>),
+    /// The watcher dropped events; anything may have changed.
+    FsLost,
     Tick,
 }
 
@@ -119,6 +122,15 @@ impl WtState {
             diff_offset: 0,
             diff_hscroll: 0,
             diff_sel: None,
+        }
+    }
+
+    /// Takes fresh info from the worktree list.
+    fn set_info(&mut self, info: Worktree) {
+        self.info = info;
+        // The `.git` file of a new worktree may not have existed when first listed.
+        if self.gitdir.as_os_str().is_empty() {
+            self.gitdir = resolve_gitdir(&self.info.path);
         }
     }
 
@@ -342,6 +354,7 @@ impl App {
 
     fn notify(&mut self, msg: String, error: bool) {
         self.toast = Some((msg, error, Instant::now()));
+        self.dirty = true;
     }
 
     pub fn visible_toast(&self) -> Option<(&str, bool)> {
@@ -372,6 +385,10 @@ impl App {
             AppEvent::Git(res) => self.on_git(res),
             AppEvent::Fs(paths) => {
                 self.on_fs(paths);
+                return std::mem::take(&mut self.dirty);
+            }
+            AppEvent::FsLost => {
+                self.refresh_all();
                 return std::mem::take(&mut self.dirty);
             }
             AppEvent::Tick => {
@@ -571,11 +588,7 @@ impl App {
                 .all(|(a, b)| a.path == b.info.path);
         if same_set {
             for (info, st) in infos.into_iter().zip(&mut self.wts) {
-                st.info = info;
-                // The `.git` file of a new worktree may not have existed when first listed.
-                if st.gitdir.as_os_str().is_empty() {
-                    st.gitdir = resolve_gitdir(&st.info.path);
-                }
+                st.set_info(info);
             }
             return;
         }
@@ -586,10 +599,7 @@ impl App {
             match old.iter().position(|w| w.info.path == info.path) {
                 Some(p) => {
                     let mut st = old.swap_remove(p);
-                    st.info = info;
-                    if st.gitdir.as_os_str().is_empty() {
-                        st.gitdir = resolve_gitdir(&st.info.path);
-                    }
+                    st.set_info(info);
                     self.wts.push(st);
                 }
                 None => {
@@ -1212,10 +1222,10 @@ enum GitPath {
     /// An allowlist, because git commands (ours too) write all sorts of files here; reacting
     /// to those would refresh in a loop.
     Ignore,
-    /// Index or submodule HEAD write: only the status of the worktree owning this git
+    /// Index or submodule ref write: only the status of the worktree owning this git
     /// directory (relative to the common directory).
     Status(PathBuf),
-    /// HEAD, refs, packed-refs: refresh everything.
+    /// HEAD, refs, packed-refs, config, info/, worktree gitdir: refresh everything.
     Refs,
 }
 
@@ -1227,13 +1237,23 @@ fn classify_git_path(rel: &Path) -> GitPath {
         [w, name, inner @ ..] if *w == "worktrees" => ([*w, *name].iter().collect(), inner),
         all => (PathBuf::new(), all),
     };
+    let is = |p: &OsStr, names: &[&str]| names.iter().any(|n| p == *n);
     match inner {
         // `index`, `index.lock`.
         [file] if file.to_string_lossy().starts_with("index") => GitPath::Status(owner),
-        [file] if ["HEAD", "packed-refs"].iter().any(|f| *file == *f) => GitPath::Refs,
-        [first, _, ..] if *first == "refs" || *first == "reftable" => GitPath::Refs,
+        // `gitdir` is rewritten by `git worktree move`; `config` and `info/` (exclude,
+        // sparse-checkout) change what status reports.
+        [file] if is(file, &["HEAD", "packed-refs", "gitdir", "config"]) => GitPath::Refs,
+        [first, _, ..] if is(first, &["refs", "reftable", "info"]) => GitPath::Refs,
         // A submodule commit or checkout changes the superproject's status.
-        [first, .., last] if *first == "modules" && *last == "HEAD" => GitPath::Status(owner),
+        [first, rest @ ..] if *first == "modules" => {
+            let refs = rest.iter().any(|p| *p == "refs") && !rest.iter().any(|p| *p == "logs");
+            if refs || rest.last().is_some_and(|l| is(l, &["HEAD", "packed-refs"])) {
+                GitPath::Status(owner)
+            } else {
+                GitPath::Ignore
+            }
+        }
         _ => GitPath::Ignore,
     }
 }
@@ -1308,8 +1328,10 @@ mod tests {
             "HEAD.lock",
             "COMMIT_EDITMSG",
             "FETCH_HEAD",
-            "config",
             "refs",
+            "worktrees/wt/locked",
+            "modules/sub/logs/refs/heads/main",
+            "modules/sub/objects/ab/cd",
         ] {
             assert_eq!(c(ignored), GitPath::Ignore, "{ignored}");
         }
@@ -1317,6 +1339,8 @@ mod tests {
         assert_eq!(c("index.lock"), status(""));
         assert_eq!(c("worktrees/wt/index"), status("worktrees/wt"));
         assert_eq!(c("modules/sub/HEAD"), status(""));
+        assert_eq!(c("modules/sub/refs/heads/main"), status(""));
+        assert_eq!(c("modules/sub/packed-refs"), status(""));
         assert_eq!(
             c("worktrees/wt/modules/a/modules/b/HEAD"),
             status("worktrees/wt")
@@ -1329,6 +1353,10 @@ mod tests {
             "refs/remotes/origin/HEAD",
             "reftable/tables.list",
             "worktrees/wt/HEAD",
+            "worktrees/wt/gitdir",
+            "config",
+            "info/exclude",
+            "worktrees/wt/info/sparse-checkout",
         ] {
             assert_eq!(c(refs), GitPath::Refs, "{refs}");
         }
