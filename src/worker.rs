@@ -2,7 +2,7 @@
 //! Queued jobs are coalesced: repeated refreshes of the same thing collapse into one.
 
 use crate::app::AppEvent;
-use crate::git::{self, Commit, Conflict, FileChange, Worktree};
+use crate::git::{self, Base, Commit, Conflict, FileChange, Worktree};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,9 +18,11 @@ pub enum Job {
         wt: PathBuf,
         skip: usize,
         count: usize,
+        base: Option<String>,
     },
     Conflicts {
         wt: PathBuf,
+        base: String,
     },
     CommitFiles {
         wt: PathBuf,
@@ -51,7 +53,7 @@ impl Job {
             Job::Worktrees => JobKey::Worktrees,
             Job::Status { wt } => JobKey::Status(wt.clone()),
             Job::Log { wt, skip, .. } => JobKey::Log(wt.clone(), *skip),
-            Job::Conflicts { wt } => JobKey::Conflicts(wt.clone()),
+            Job::Conflicts { wt, .. } => JobKey::Conflicts(wt.clone()),
             // Only the latest file list / diff request matters.
             Job::CommitFiles { .. } => JobKey::CommitFiles,
             Job::Diff { .. } => JobKey::Diff,
@@ -60,7 +62,10 @@ impl Job {
 }
 
 pub enum GitResult {
-    Worktrees(Result<Vec<Worktree>>),
+    Worktrees {
+        res: Result<Vec<Worktree>>,
+        base: Option<Base>,
+    },
     Status {
         wt: PathBuf,
         res: Result<Vec<FileChange>>,
@@ -120,13 +125,21 @@ fn coalesce(jobs: Vec<Job>) -> Vec<Job> {
 
 fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
     match job {
-        Job::Worktrees => GitResult::Worktrees(git::list_worktrees(repo_dir)),
+        Job::Worktrees => GitResult::Worktrees {
+            res: git::list_worktrees(repo_dir),
+            base: git::resolve_base(repo_dir),
+        },
         Job::Status { wt } => {
             let res = git::status(&wt);
             GitResult::Status { wt, res }
         }
-        Job::Log { wt, skip, count } => {
-            let res = git::log(&wt, skip, count);
+        Job::Log {
+            wt,
+            skip,
+            count,
+            base,
+        } => {
+            let res = git::log(&wt, skip, count, base.as_deref());
             GitResult::Log {
                 wt,
                 skip,
@@ -134,8 +147,8 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
                 res,
             }
         }
-        Job::Conflicts { wt } => {
-            let conflict = git::conflicts_with_base(&wt);
+        Job::Conflicts { wt, base } => {
+            let conflict = git::conflicts_with_base(&wt, &base);
             GitResult::Conflicts { wt, conflict }
         }
         Job::CommitFiles { wt, id, commit } => {
@@ -170,14 +183,20 @@ mod tests {
             Job::Status { wt: b.clone() },
             Job::Worktrees,
             Job::Status { wt: a.clone() },
-            Job::Conflicts { wt: a.clone() },
-            Job::Conflicts { wt: a.clone() },
+            Job::Conflicts {
+                wt: a.clone(),
+                base: "main".into(),
+            },
+            Job::Conflicts {
+                wt: a.clone(),
+                base: "main".into(),
+            },
         ];
         let out = coalesce(jobs);
         assert_eq!(out.len(), 4);
         assert!(matches!(&out[0], Job::Status { wt } if *wt == b));
         assert!(matches!(&out[1], Job::Worktrees));
         assert!(matches!(&out[2], Job::Status { wt } if *wt == a));
-        assert!(matches!(&out[3], Job::Conflicts { wt } if *wt == a));
+        assert!(matches!(&out[3], Job::Conflicts { wt, .. } if *wt == a));
     }
 }

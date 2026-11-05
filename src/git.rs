@@ -272,14 +272,42 @@ pub fn default_branch(dir: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Default branch to compare a worktree against. `None` when HEAD is detached, no default branch
-/// exists, or the worktree is on the default branch itself.
-pub fn base_for(wt: &Path) -> Option<String> {
-    let base = default_branch(wt)?;
-    let out = run_ok(wt, &["symbolic-ref", "-q", "--short", "HEAD"]).ok()?;
-    let current = String::from_utf8_lossy(&out).trim().to_string();
-    let short_base = base.rsplit('/').next().unwrap_or(&base);
+/// The default branch together with the commit it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Base {
+    pub name: String,
+    pub sha: String,
+}
+
+pub fn resolve_base(dir: &Path) -> Option<Base> {
+    let name = default_branch(dir)?;
+    let out = run_ok(
+        dir,
+        &["rev-parse", "--verify", "-q", &format!("{name}^{{commit}}")],
+    )
+    .ok()?;
+    let sha = String::from_utf8_lossy(&out).trim().to_string();
+    Some(Base { name, sha })
+}
+
+/// Base to compare a worktree on `branch` against. `None` when HEAD is detached or the worktree
+/// is on the default branch itself.
+pub fn base_for<'a>(branch: Option<&str>, base: &'a str) -> Option<&'a str> {
+    let current = branch?;
+    let short_base = base.rsplit('/').next().unwrap_or(base);
     (current != base && current != short_base).then_some(base)
+}
+
+/// Reads the git directory of a worktree: `.git` itself, or the `gitdir:` a linked worktree's
+/// `.git` file points to. Plain file I/O, no git process.
+pub fn gitdir(wt: &Path) -> Option<PathBuf> {
+    let dot_git = wt.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let s = std::fs::read_to_string(&dot_git).ok()?;
+    let dir = s.lines().next()?.strip_prefix("gitdir:")?.trim();
+    Some(wt.join(dir))
 }
 
 /// Files that would conflict when merging the worktree's HEAD into its base branch.
@@ -291,16 +319,18 @@ pub struct Conflict {
 
 /// Dry-run merge via `git merge-tree` (git >= 2.38; never touches the index or working tree).
 /// `None` when clean, there is no base, or git cannot tell (e.g. too old).
-pub fn conflicts_with_base(wt: &Path) -> Option<Conflict> {
-    let base = base_for(wt)?;
+pub fn conflicts_with_base(wt: &Path, base: &str) -> Option<Conflict> {
     let out = run(
         wt,
-        &["merge-tree", "--write-tree", "--name-only", &base, "HEAD"],
+        &["merge-tree", "--write-tree", "--name-only", base, "HEAD"],
         &[0, 1],
     )
     .ok()?;
     let files = parse_merge_tree(&String::from_utf8_lossy(&out));
-    (!files.is_empty()).then_some(Conflict { base, files })
+    (!files.is_empty()).then(|| Conflict {
+        base: base.to_string(),
+        files,
+    })
 }
 
 /// Parses `merge-tree --write-tree --name-only` output: tree OID, conflicted paths, blank line, messages.
@@ -315,10 +345,8 @@ fn parse_merge_tree(out: &str) -> Vec<String> {
     files
 }
 
-pub fn log(wt: &Path, skip: usize, count: usize) -> Result<Vec<Commit>> {
-    if !has_head(wt) {
-        return Ok(Vec::new());
-    }
+/// Commits on HEAD, limited to those not on `base` when given.
+pub fn log(wt: &Path, skip: usize, count: usize, base: Option<&str>) -> Result<Vec<Commit>> {
     let n = format!("-n{count}");
     let skip = format!("--skip={skip}");
     let mut args = vec![
@@ -327,12 +355,16 @@ pub fn log(wt: &Path, skip: usize, count: usize) -> Result<Vec<Commit>> {
         &skip,
         "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%D%x1f%P%x1f%s%x1e",
     ];
-    let range = base_for(wt).map(|b| format!("{b}..HEAD"));
+    let range = base.map(|b| format!("{b}..HEAD"));
     if let Some(r) = &range {
         args.push(r);
     }
-    let out = run_ok(wt, &args)?;
-    Ok(parse_log(&String::from_utf8_lossy(&out)))
+    match run_ok(wt, &args) {
+        Ok(out) => Ok(parse_log(&String::from_utf8_lossy(&out))),
+        // Only probe for an unborn HEAD when log fails, so the common case is one process.
+        Err(_) if !has_head(wt) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn parse_log(s: &str) -> Vec<Commit> {
@@ -442,10 +474,16 @@ pub fn working_diff(wt: &Path, file: &FileChange) -> Result<String> {
         )?;
         return Ok(cap(out));
     }
-    let base = if has_head(wt) { "HEAD" } else { EMPTY_TREE };
-    let mut args = vec!["diff", "--no-ext-diff", "-M", base];
-    args.extend(pathspec(file));
-    Ok(cap(run_ok(wt, &args)?))
+    let diff = |base| {
+        let mut args = vec!["diff", "--no-ext-diff", "-M", base];
+        args.extend(pathspec(file));
+        run_ok(wt, &args)
+    };
+    match diff("HEAD") {
+        Ok(out) => Ok(cap(out)),
+        Err(_) if !has_head(wt) => Ok(cap(diff(EMPTY_TREE)?)),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn commit_diff(wt: &Path, commit: &Commit, file: &FileChange) -> Result<String> {
@@ -545,18 +583,33 @@ mod tests {
             &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
         );
 
-        // On the default branch itself: nothing to compare.
-        assert_eq!(conflicts_with_base(&main), None);
+        let base = resolve_base(&main).unwrap();
+        assert_eq!(base.name, "master");
+        assert_eq!(base.sha.len(), 40);
 
         std::fs::write(wt.join("a.txt"), "feat\n").unwrap();
         sh(&wt, &["commit", "-q", "-am", "feat change"]);
-        assert_eq!(conflicts_with_base(&wt), None);
+        assert_eq!(conflicts_with_base(&wt, &base.name), None);
 
         std::fs::write(main.join("a.txt"), "master\n").unwrap();
         sh(&main, &["commit", "-q", "-am", "master change"]);
-        let c = conflicts_with_base(&wt).unwrap();
+        assert_ne!(resolve_base(&main).unwrap().sha, base.sha);
+        let c = conflicts_with_base(&wt, &base.name).unwrap();
         assert_eq!(c.base, "master");
         assert_eq!(c.files, vec!["a.txt"]);
+
+        let gd = gitdir(&wt).unwrap();
+        assert!(gd.ends_with("worktrees/wt"), "{gd:?}");
+        assert!(gitdir(&main).unwrap().ends_with(".git"));
+    }
+
+    #[test]
+    fn picks_base_for_branch() {
+        assert_eq!(base_for(Some("feat"), "main"), Some("main"));
+        assert_eq!(base_for(Some("main"), "main"), None);
+        assert_eq!(base_for(Some("main"), "origin/main"), None);
+        assert_eq!(base_for(Some("feat"), "origin/main"), Some("origin/main"));
+        assert_eq!(base_for(None, "main"), None);
     }
 
     #[test]
@@ -569,7 +622,7 @@ mod tests {
         // Repo without commits: worktree diff falls back to the empty tree.
         std::fs::write(main.join("a.txt"), "one\ntwo\n").unwrap();
         sh(&main, &["add", "a.txt"]);
-        assert!(log(&main, 0, 10).unwrap().is_empty());
+        assert!(log(&main, 0, 10, None).unwrap().is_empty());
         let st = status(&main).unwrap();
         assert_eq!(st[0].status, FileStatus::Added);
         assert!(working_diff(&main, &st[0]).unwrap().contains("+one"));
@@ -618,7 +671,7 @@ mod tests {
         assert!(status(&wt2).unwrap().is_empty());
 
         sh(&main, &["commit", "-q", "-am", "second"]);
-        let commits = log(&main, 0, 10).unwrap();
+        let commits = log(&main, 0, 10, None).unwrap();
         assert_eq!(
             commits
                 .iter()
@@ -637,7 +690,7 @@ mod tests {
         // Root commit diffs against the empty tree.
         let root_files = commit_files(&main, &commits[1]).unwrap();
         assert_eq!(root_files.len(), 3);
-        assert_eq!(log(&main, 1, 10).unwrap().len(), 1);
+        assert_eq!(log(&main, 1, 10, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -662,13 +715,13 @@ mod tests {
                 feat.to_str().unwrap(),
             ],
         );
-        assert!(log(&feat, 0, 10).unwrap().is_empty());
+        assert!(log(&feat, 0, 10, Some("main")).unwrap().is_empty());
         sh(&feat, &["commit", "-q", "--allow-empty", "-m", "on feat"]);
 
-        let feat_log = log(&feat, 0, 10).unwrap();
+        let feat_log = log(&feat, 0, 10, Some("main")).unwrap();
         assert_eq!(feat_log.len(), 1);
         assert_eq!(feat_log[0].subject, "on feat");
-        assert_eq!(log(&main, 0, 10).unwrap().len(), 2);
+        assert_eq!(log(&main, 0, 10, None).unwrap().len(), 2);
     }
 
     #[test]
