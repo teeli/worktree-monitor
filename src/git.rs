@@ -249,21 +249,56 @@ pub fn has_head(wt: &Path) -> bool {
     run_ok(wt, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok()
 }
 
+/// The repository's default branch: `origin/HEAD` if set, else a local `main` or `master`.
+pub fn default_branch(dir: &Path) -> Option<String> {
+    if let Ok(out) = run_ok(
+        dir,
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let name = String::from_utf8_lossy(&out).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    ["main", "master"]
+        .into_iter()
+        .find(|b| {
+            run_ok(
+                dir,
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+            )
+            .is_ok()
+        })
+        .map(String::from)
+}
+
+/// Ref to exclude from a worktree's log so only its own commits remain. `None` (full history) when
+/// HEAD is detached, no default branch exists, or the worktree is on the default branch itself.
+fn log_base(wt: &Path) -> Option<String> {
+    let base = default_branch(wt)?;
+    let out = run_ok(wt, &["symbolic-ref", "-q", "--short", "HEAD"]).ok()?;
+    let current = String::from_utf8_lossy(&out).trim().to_string();
+    let short_base = base.rsplit('/').next().unwrap_or(&base);
+    (current != base && current != short_base).then_some(base)
+}
+
 pub fn log(wt: &Path, skip: usize, count: usize) -> Result<Vec<Commit>> {
     if !has_head(wt) {
         return Ok(Vec::new());
     }
     let n = format!("-n{count}");
     let skip = format!("--skip={skip}");
-    let out = run_ok(
-        wt,
-        &[
-            "log",
-            &n,
-            &skip,
-            "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%D%x1f%P%x1f%s%x1e",
-        ],
-    )?;
+    let mut args = vec![
+        "log",
+        &n,
+        &skip,
+        "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%D%x1f%P%x1f%s%x1e",
+    ];
+    let range = log_base(wt).map(|b| format!("{b}..HEAD"));
+    if let Some(r) = &range {
+        args.push(r);
+    }
+    let out = run_ok(wt, &args)?;
     Ok(parse_log(&String::from_utf8_lossy(&out)))
 }
 
@@ -529,6 +564,37 @@ mod tests {
         let root_files = commit_files(&main, &commits[1]).unwrap();
         assert_eq!(root_files.len(), 3);
         assert_eq!(log(&main, 1, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn log_is_scoped_to_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        sh(&main, &["init", "-q", "-b", "main"]);
+        for m in ["one", "two"] {
+            sh(&main, &["commit", "-q", "--allow-empty", "-m", m]);
+        }
+        assert_eq!(default_branch(&main).as_deref(), Some("main"));
+        let feat = tmp.path().join("feat");
+        sh(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                feat.to_str().unwrap(),
+            ],
+        );
+        assert!(log(&feat, 0, 10).unwrap().is_empty());
+        sh(&feat, &["commit", "-q", "--allow-empty", "-m", "on feat"]);
+
+        let feat_log = log(&feat, 0, 10).unwrap();
+        assert_eq!(feat_log.len(), 1);
+        assert_eq!(feat_log[0].subject, "on feat");
+        assert_eq!(log(&main, 0, 10).unwrap().len(), 2);
     }
 
     #[test]
