@@ -3,7 +3,7 @@
 use crate::clipboard::Clipboard;
 use crate::diff::{self, Diff};
 use crate::git::{self, Commit, FileChange, Repo, Worktree};
-use crate::keymap::{self, Action, Lookup, Scope};
+use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
 use crate::watcher::{self, FsWatcher};
@@ -37,26 +37,6 @@ pub enum Pane {
     Tree,
     Diff,
     Commits,
-}
-
-impl Pane {
-    const ORDER: [Pane; 3] = [Pane::Tree, Pane::Diff, Pane::Commits];
-
-    fn scope(self) -> Scope {
-        match self {
-            Pane::Tree => Scope::Tree,
-            Pane::Diff => Scope::Diff,
-            Pane::Commits => Scope::Commits,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Pane::Tree => "FILES",
-            Pane::Diff => "DIFF",
-            Pane::Commits => "COMMITS",
-        }
-    }
 }
 
 /// Everything shown for one worktree; kept per worktree so switching tabs restores it.
@@ -184,7 +164,6 @@ pub struct App {
     pub theme: Theme,
     pub wts: Vec<WtState>,
     pub active: usize,
-    pub focus: Pane,
     pub help: bool,
     pub help_scroll: usize,
     pub toast: Option<(String, bool, Instant)>,
@@ -218,7 +197,6 @@ impl App {
             theme,
             wts,
             active,
-            focus: Pane::Tree,
             help: false,
             help_scroll: 0,
             toast: None,
@@ -621,7 +599,7 @@ impl App {
             Some(p) => format!("{p} {name}"),
             None => name,
         };
-        match keymap::lookup(&seq, self.focus.scope()) {
+        match keymap::lookup(&seq) {
             Lookup::Action(a) => self.act(a),
             Lookup::Pending => self.pending_keys = Some(seq),
             Lookup::None => {}
@@ -635,18 +613,6 @@ impl App {
             Action::Help => {
                 self.help = true;
                 self.help_scroll = 0;
-            }
-            Action::FocusNext | Action::FocusPrev => {
-                let pos = Pane::ORDER
-                    .iter()
-                    .position(|p| *p == self.focus)
-                    .unwrap_or(0);
-                let step = if action == Action::FocusNext {
-                    1
-                } else {
-                    Pane::ORDER.len() - 1
-                };
-                self.focus = Pane::ORDER[(pos + step) % Pane::ORDER.len()];
             }
             Action::Worktree(i) => self.switch_worktree(i),
             Action::PrevWorktree if n > 0 => self.switch_worktree((self.active + n - 1) % n),
@@ -678,16 +644,13 @@ impl App {
             Action::CollapseRecursive | Action::ExpandRecursive => {
                 self.set_collapsed_recursive(action == Action::CollapseRecursive)
             }
+            Action::FoldAll | Action::UnfoldAll => self.fold_all(action == Action::FoldAll),
             Action::NextHunk | Action::PrevHunk => self.jump_hunk(action == Action::NextHunk),
-            Action::Escape => match self.focus {
-                Pane::Diff => {
-                    if let Some(st) = self.wts.get_mut(self.active) {
-                        st.diff_sel = None;
-                    }
+            Action::Escape => {
+                if let Some(st) = self.wts.get_mut(self.active) {
+                    st.diff_sel = None;
                 }
-                Pane::Commits => self.select_commit(0),
-                Pane::Tree => {}
-            },
+            }
             Action::PrevWorktree | Action::NextWorktree => {}
         }
     }
@@ -702,49 +665,30 @@ impl App {
     }
 
     fn page(&self, div: usize) -> isize {
-        (self.pane_height(self.focus) / div).max(1) as isize
+        (self.pane_height(Pane::Diff) / div).max(1) as isize
     }
 
-    /// Moves the focused pane's cursor. In the diff, single steps start/move the line
-    /// selection; larger jumps scroll and carry an existing selection along.
+    /// Moves the diff cursor. Single steps start/move the line selection; larger jumps
+    /// scroll and carry an existing selection along.
     fn move_by(&mut self, delta: isize, single: bool) {
-        let height = self.pane_height(self.focus);
-        let active = self.active;
-        let Some(st) = self.wts.get_mut(active) else {
+        let height = self.pane_height(Pane::Diff);
+        let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
-        match self.focus {
-            Pane::Tree => {
-                let target = offset(st.tree_cursor, delta, st.rows.len());
-                self.select_row(active, target);
-                let st = &mut self.wts[active];
-                ensure_visible(&mut st.tree_offset, st.tree_cursor, height);
+        let len = st.diff.lines.len();
+        match st.diff_sel {
+            None if single => {
+                st.diff_sel = Some(offset(
+                    st.diff_offset,
+                    if delta > 0 { 0 } else { delta },
+                    len,
+                ))
             }
-            Pane::Commits => {
-                st.commit_cursor = offset(st.commit_cursor, delta, st.commits.len() + 1);
-                ensure_visible(&mut st.commit_offset, st.commit_cursor, height);
-                self.maybe_load_more();
-            }
-            Pane::Diff => {
-                let len = st.diff.lines.len();
-                match st.diff_sel {
-                    None if single => {
-                        st.diff_sel = Some(offset(
-                            st.diff_offset,
-                            if delta > 0 { 0 } else { delta },
-                            len,
-                        ))
-                    }
-                    None => {
-                        st.diff_offset =
-                            offset(st.diff_offset, delta, len.saturating_sub(height - 1))
-                    }
-                    Some(s) => st.diff_sel = Some(offset(s, delta, len)),
-                }
-                if let Some(s) = st.diff_sel {
-                    ensure_visible(&mut st.diff_offset, s, height);
-                }
-            }
+            None => st.diff_offset = offset(st.diff_offset, delta, len.saturating_sub(height - 1)),
+            Some(s) => st.diff_sel = Some(offset(s, delta, len)),
+        }
+        if let Some(s) = st.diff_sel {
+            ensure_visible(&mut st.diff_offset, s, height);
         }
     }
 
@@ -790,10 +734,21 @@ impl App {
             return false;
         };
         let cur = st.tree_cursor;
+        // Collapsed directories hide their files, so they are the only stops besides files.
+        let stop = |r: usize| {
+            st.row_file(r).is_some()
+                || matches!(
+                    st.rows[r].kind,
+                    RowKind::Dir {
+                        expanded: false,
+                        ..
+                    }
+                )
+        };
         let found = if forward {
-            (cur + 1..st.rows.len()).find(|&r| st.row_file(r).is_some())
+            (cur + 1..st.rows.len()).find(|&r| stop(r))
         } else {
-            (0..cur).rev().find(|&r| st.row_file(r).is_some())
+            (0..cur).rev().find(|&r| stop(r))
         };
         if let Some(r) = found {
             self.select_row(active, r);
@@ -808,53 +763,11 @@ impl App {
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
-        match self.focus {
-            Pane::Diff => {
-                st.diff_hscroll = if right {
-                    st.diff_hscroll + HSCROLL_COLS
-                } else {
-                    st.diff_hscroll.saturating_sub(HSCROLL_COLS)
-                };
-            }
-            Pane::Tree => {
-                let Some(row) = st.rows.get(st.tree_cursor).cloned() else {
-                    return;
-                };
-                match (&row.kind, right) {
-                    (
-                        RowKind::Dir {
-                            path,
-                            expanded: true,
-                        },
-                        false,
-                    ) => {
-                        st.collapsed.insert(path.clone());
-                        st.rebuild_rows();
-                    }
-                    (
-                        RowKind::Dir {
-                            path,
-                            expanded: false,
-                        },
-                        true,
-                    ) => {
-                        st.collapsed.remove(path);
-                        st.rebuild_rows();
-                    }
-                    (RowKind::Dir { expanded: true, .. }, true) => self.move_by(1, true),
-                    (_, false) => {
-                        if let Some(parent) = (0..st.tree_cursor)
-                            .rev()
-                            .find(|&r| st.rows[r].depth < row.depth)
-                        {
-                            st.tree_cursor = parent;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Pane::Commits => {}
-        }
+        st.diff_hscroll = if right {
+            st.diff_hscroll + HSCROLL_COLS
+        } else {
+            st.diff_hscroll.saturating_sub(HSCROLL_COLS)
+        };
     }
 
     /// Collapses or expands the directory at the cursor (or containing the file at the
@@ -890,30 +803,57 @@ impl App {
         st.rebuild_rows();
     }
 
-    fn toggle(&mut self) {
-        let active = self.active;
-        let Some(st) = self.wts.get_mut(active) else {
+    /// Collapses or expands every directory, keeping the cursor on the same row or, if it
+    /// got hidden, on its nearest visible ancestor.
+    fn fold_all(&mut self, collapse: bool) {
+        let height = self.pane_height(Pane::Tree);
+        let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
-        match self.focus {
-            Pane::Tree => match st.rows.get(st.tree_cursor).map(|r| r.kind.clone()) {
-                Some(RowKind::Dir { path, expanded }) => {
-                    if expanded {
-                        st.collapsed.insert(path);
-                    } else {
-                        st.collapsed.remove(&path);
-                    }
-                    st.rebuild_rows();
-                }
-                Some(RowKind::File(_)) => self.focus = Pane::Diff,
-                None => {}
-            },
-            Pane::Commits => {
-                let c = st.commit_cursor;
-                self.select_commit(c);
-            }
-            Pane::Diff => {}
+        let mut target = st.rows.get(st.tree_cursor).map(|r| r.path.clone());
+        if collapse {
+            let dirs = tree::all_dirs(st.files());
+            st.collapsed.extend(dirs);
+        } else {
+            st.collapsed.clear();
         }
+        st.rebuild_rows();
+        while let Some(p) = target {
+            if let Some(i) = st.rows.iter().position(|r| r.path == p) {
+                st.tree_cursor = i;
+                break;
+            }
+            target = p.rfind('/').map(|k| p[..k].to_string());
+        }
+        ensure_visible(&mut st.tree_offset, st.tree_cursor, height);
+    }
+
+    /// Collapses or expands the directory at the tree cursor, or the one containing the
+    /// file at the cursor (moving the cursor onto it when collapsing).
+    fn toggle(&mut self) {
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        let Some(row) = st.rows.get(st.tree_cursor) else {
+            return;
+        };
+        let dir_row = match row.kind {
+            RowKind::Dir { .. } => Some(st.tree_cursor),
+            RowKind::File(_) => (0..st.tree_cursor)
+                .rev()
+                .find(|&r| st.rows[r].depth < row.depth),
+        };
+        let Some(dir_row) = dir_row else { return };
+        let RowKind::Dir { path, expanded } = st.rows[dir_row].kind.clone() else {
+            return;
+        };
+        if expanded {
+            st.collapsed.insert(path);
+            st.tree_cursor = dir_row;
+        } else {
+            st.collapsed.remove(&path);
+        }
+        st.rebuild_rows();
     }
 
     fn jump_hunk(&mut self, forward: bool) {
@@ -987,7 +927,6 @@ impl App {
                     return;
                 }
                 let Some((pane, rect)) = pane_at else { return };
-                self.focus = pane;
                 let rel = (m.row - rect.y) as usize;
                 let active = self.active;
                 let Some(st) = self.wts.get_mut(active) else {
