@@ -1,7 +1,7 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
 use crate::app::App;
-use crate::diff::LineKind;
+use crate::diff::{Diff, LineKind};
 use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
 use crate::theme::Theme;
 use crate::tree::RowKind;
@@ -284,6 +284,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme.clone();
+    let wrap = app.wrap;
     let Some(st) = app.wts.get_mut(app.active) else {
         return;
     };
@@ -294,7 +295,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 format!(" +{} -{}", st.diff.added, st.diff.removed)
             };
-            format!(" {}{stats} ", file.path)
+            let wrapped = if wrap { " · wrap" } else { "" };
+            format!(" {}{stats}{wrapped} ", file.path)
         }
         None => " Diff ".to_string(),
     };
@@ -330,52 +332,96 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     let h = inner.height as usize;
     let len = st.diff.lines.len();
-    clamp_offset(&mut st.diff_offset, len, h);
+    if !wrap {
+        clamp_offset(&mut st.diff_offset, len, h);
+    }
     let num_w = st.diff.max_line_no().to_string().len().max(3);
     let gutter_w = num_w * 2 + 2;
     let text_w = (inner.width as usize).saturating_sub(gutter_w + 1);
     let num = |n: Option<u32>| n.map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
     let sel_style = theme.diff_sel;
+    let hscroll = st.diff_hscroll;
 
-    let lines: Vec<Line> = st
-        .diff
-        .lines
-        .iter()
-        .enumerate()
-        .skip(st.diff_offset)
-        .take(h)
-        .map(|(i, l)| {
-            let (marker, style) = match l.kind {
-                LineKind::Add => ("+", theme.add),
-                LineKind::Del => ("-", theme.del),
-                LineKind::Context => (" ", theme.base),
-                LineKind::Hunk => ("", theme.hunk),
-                LineKind::FileHeader => ("", theme.file_header),
-                LineKind::Meta => ("", theme.dim),
-            };
-            let gutter = format!("{} {} ", num(l.old), num(l.new));
-            let text = skip_cols(&l.text, st.diff_hscroll);
+    let build = |gutter: String, marker: &'static str, text: &str, style: Style, selected: bool| {
+        let gutter_style = if selected {
+            theme.gutter_sel
+        } else {
+            theme.dim
+        };
+        let mut spans = vec![Span::styled(gutter, gutter_style)];
+        spans.extend(fit_spans(
+            vec![
+                Span::styled(marker, style),
+                Span::styled(text.to_string(), style),
+            ],
+            text_w + 1,
+        ));
+        // Span styles carry their own bg (e.g. Dracula), so the selection
+        // is patched onto the finished row (gutter and padding included).
+        let row_style = if selected { sel_style } else { Style::new() };
+        patch_row(spans, row_style)
+    };
+    let line_style = |kind: LineKind| match kind {
+        LineKind::Add => ("+", theme.add),
+        LineKind::Del => ("-", theme.del),
+        LineKind::Context => (" ", theme.base),
+        LineKind::Hunk => ("", theme.hunk),
+        LineKind::FileHeader => ("", theme.file_header),
+        LineKind::Meta => ("", theme.dim),
+    };
+
+    let lines: Vec<Line> = if wrap {
+        st.diff_offset = st.diff_offset.min(len - 1);
+        if let Some(sel) = st.diff_sel {
+            // Scroll so the whole selected line fits, if it can.
+            st.diff_offset = st.diff_offset.min(sel);
+            let rows = |i: usize| wrap_ranges(&st.diff.lines[i].text, text_w).len();
+            let mut total: usize = (st.diff_offset..=sel).map(rows).sum();
+            while total > h && st.diff_offset < sel {
+                total -= rows(st.diff_offset);
+                st.diff_offset += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(h);
+        for (i, l) in st.diff.lines.iter().enumerate().skip(st.diff_offset) {
+            if out.len() >= h {
+                break;
+            }
+            let (marker, style) = line_style(l.kind);
             let selected = st.diff_sel == Some(i);
-            let gutter_style = if selected {
-                theme.gutter_sel
-            } else {
-                theme.dim
-            };
-            let mut spans = vec![Span::styled(gutter, gutter_style)];
-            spans.extend(fit_spans(
-                vec![Span::styled(marker, style), Span::styled(text, style)],
-                text_w + 1,
-            ));
-            // Span styles carry their own bg (e.g. Dracula), so the selection
-            // is patched onto the finished row (gutter and padding included).
-            let row_style = if selected { sel_style } else { Style::new() };
-            patch_row(spans, row_style)
-        })
-        .collect();
+            for (k, chunk) in wrap_ranges(&l.text, text_w).into_iter().enumerate() {
+                if out.len() >= h {
+                    break;
+                }
+                out.push(if k == 0 {
+                    let gutter = format!("{} {} ", num(l.old), num(l.new));
+                    build(gutter, marker, chunk, style, selected)
+                } else {
+                    build(" ".repeat(gutter_w), " ", chunk, style, selected)
+                });
+            }
+        }
+        out
+    } else {
+        st.diff
+            .lines
+            .iter()
+            .enumerate()
+            .skip(st.diff_offset)
+            .take(h)
+            .map(|(i, l)| {
+                let (marker, style) = line_style(l.kind);
+                let gutter = format!("{} {} ", num(l.old), num(l.new));
+                let text = skip_cols(&l.text, hscroll);
+                build(gutter, marker, text, style, st.diff_sel == Some(i))
+            })
+            .collect()
+    };
     f.render_widget(Paragraph::new(lines), inner);
 
-    if len > h {
-        let mut state = ScrollbarState::new(len.saturating_sub(h)).position(st.diff_offset);
+    let scroll_range = if wrap { len - 1 } else { len.saturating_sub(h) };
+    if scroll_range > 0 {
+        let mut state = ScrollbarState::new(scroll_range).position(st.diff_offset);
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
@@ -389,6 +435,50 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// Splits `text` into rows of at most `width` display columns, preferring to break after
+/// whitespace. Always returns at least one row and makes progress for any `width`.
+pub fn wrap_ranges(text: &str, width: usize) -> Vec<&str> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let (mut cols, mut end, mut last_break) = (0, 0, None);
+        for (i, c) in rest.char_indices() {
+            let w = c.width().unwrap_or(0);
+            if cols + w > width && end > 0 {
+                break;
+            }
+            cols += w;
+            end = i + c.len_utf8();
+            if c.is_whitespace() {
+                last_break = Some(end);
+            }
+        }
+        if end == rest.len() {
+            out.push(rest);
+            return out;
+        }
+        let cut = last_break.unwrap_or(end);
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+}
+
+/// Maps a screen row (relative to the diff pane) to the diff line drawn there when wrapping.
+/// Returns `diff.lines.len()` when the row is past the end.
+pub fn line_at_row(diff: &Diff, offset: usize, rel: usize, inner_width: u16) -> usize {
+    let num_w = diff.max_line_no().to_string().len().max(3);
+    let text_w = (inner_width as usize).saturating_sub(num_w * 2 + 3);
+    let mut row = 0;
+    for (i, l) in diff.lines.iter().enumerate().skip(offset) {
+        row += wrap_ranges(&l.text, text_w).len();
+        if rel < row {
+            return i;
+        }
+    }
+    diff.lines.len()
 }
 
 fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
@@ -609,5 +699,19 @@ mod tests {
         assert_eq!(text, "ab  ");
         assert_eq!(skip_cols("hello", 2), "llo");
         assert_eq!(skip_cols("hi", 5), "");
+    }
+
+    #[test]
+    fn wraps_text() {
+        assert_eq!(wrap_ranges("", 5), vec![""]);
+        assert_eq!(wrap_ranges("abc", 5), vec!["abc"]);
+        assert_eq!(
+            wrap_ranges("hello world foo", 8),
+            vec!["hello ", "world ", "foo"]
+        );
+        assert_eq!(wrap_ranges("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_ranges("日本語", 4), vec!["日本", "語"]);
+        assert_eq!(wrap_ranges("日本", 1), vec!["日", "本"]);
+        assert_eq!(wrap_ranges("abc", 0), vec!["a", "b", "c"]);
     }
 }

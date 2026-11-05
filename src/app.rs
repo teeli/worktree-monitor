@@ -168,6 +168,8 @@ pub struct App {
     pub wts: Vec<WtState>,
     pub active: usize,
     pub help: bool,
+    /// Soft-wrap long diff lines instead of truncating them.
+    pub wrap: bool,
     pub help_scroll: usize,
     pub toast: Option<(String, bool, Instant)>,
     pub hit: HitAreas,
@@ -201,6 +203,7 @@ impl App {
             wts,
             active,
             help: false,
+            wrap: false,
             help_scroll: 0,
             toast: None,
             hit: HitAreas::default(),
@@ -655,6 +658,14 @@ impl App {
             }
             Action::FoldAll | Action::UnfoldAll => self.fold_all(action == Action::FoldAll),
             Action::NextHunk | Action::PrevHunk => self.jump_hunk(action == Action::NextHunk),
+            Action::ToggleWrap => {
+                self.wrap = !self.wrap;
+                if let Some(st) = self.wts.get_mut(self.active) {
+                    st.diff_hscroll = 0;
+                }
+                let msg = if self.wrap { "Wrap on" } else { "Wrap off" };
+                self.notify(msg.into(), false);
+            }
             Action::Escape => {
                 if let Some(st) = self.wts.get_mut(self.active) {
                     st.diff_sel = None;
@@ -693,7 +704,14 @@ impl App {
                     len,
                 ))
             }
-            None => st.diff_offset = offset(st.diff_offset, delta, len.saturating_sub(height - 1)),
+            None => {
+                let max = if self.wrap {
+                    len
+                } else {
+                    len.saturating_sub(height - 1)
+                };
+                st.diff_offset = offset(st.diff_offset, delta, max)
+            }
             Some(s) => st.diff_sel = Some(offset(s, delta, len)),
         }
         if let Some(s) = st.diff_sel {
@@ -769,6 +787,9 @@ impl App {
     }
 
     fn left_right(&mut self, right: bool) {
+        if self.wrap {
+            return;
+        }
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
@@ -954,7 +975,16 @@ impl App {
                         }
                     }
                     Pane::Diff => {
-                        let line = st.diff_offset + rel;
+                        let line = if self.wrap {
+                            crate::ui::line_at_row(
+                                &st.diff,
+                                st.diff_offset,
+                                rel,
+                                self.hit.diff.width,
+                            )
+                        } else {
+                            st.diff_offset + rel
+                        };
                         if line < st.diff.lines.len() {
                             st.diff_sel = Some(line);
                         }
@@ -994,11 +1024,12 @@ impl App {
                             offset(st.tree_offset, delta, st.rows.len().saturating_sub(h) + 1)
                     }
                     Pane::Diff => {
-                        st.diff_offset = offset(
-                            st.diff_offset,
-                            delta,
-                            st.diff.lines.len().saturating_sub(h) + 1,
-                        )
+                        let max = if self.wrap {
+                            st.diff.lines.len()
+                        } else {
+                            st.diff.lines.len().saturating_sub(h) + 1
+                        };
+                        st.diff_offset = offset(st.diff_offset, delta, max)
                     }
                     Pane::Commits => {
                         st.commit_offset = offset(
@@ -1014,7 +1045,7 @@ impl App {
                 if matches!(pane_at, Some((Pane::Diff, _))) =>
             {
                 let right = m.kind == MouseEventKind::ScrollRight;
-                if let Some(st) = self.wts.get_mut(self.active) {
+                if let Some(st) = self.wts.get_mut(self.active).filter(|_| !self.wrap) {
                     st.diff_hscroll = if right {
                         st.diff_hscroll + HSCROLL_COLS
                     } else {
