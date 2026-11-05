@@ -2,7 +2,7 @@
 
 use crate::clipboard::Clipboard;
 use crate::diff::{self, Diff};
-use crate::git::{self, Commit, FileChange, Repo, Worktree};
+use crate::git::{self, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
@@ -47,6 +47,8 @@ pub struct WtState {
     pub changes: Vec<FileChange>,
     pub loaded: bool,
     pub error: Option<String>,
+    /// Merge conflicts with the default branch, if any.
+    pub conflict: Option<Conflict>,
 
     pub commits: Vec<Commit>,
     pub log_exhausted: bool,
@@ -86,6 +88,7 @@ impl WtState {
             changes: Vec::new(),
             loaded: false,
             error: None,
+            conflict: None,
             commits: Vec::new(),
             log_exhausted: false,
             log_loading: false,
@@ -253,6 +256,7 @@ impl App {
         let wt = st.info.path.clone();
         let count = st.commits.len().max(LOG_PAGE);
         self.send(Job::Status { wt: wt.clone() });
+        self.send(Job::Conflicts { wt: wt.clone() });
         if i == self.active {
             self.send(Job::Log { wt, skip: 0, count });
         }
@@ -352,6 +356,11 @@ impl App {
                         }
                     }
                     Err(e) => st.error = Some(format!("{e:#}")),
+                }
+            }
+            GitResult::Conflicts { wt, conflict } => {
+                if let Some(i) = self.index_of(&wt) {
+                    self.wts[i].conflict = conflict;
                 }
             }
             GitResult::Log {

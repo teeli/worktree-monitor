@@ -272,14 +272,47 @@ pub fn default_branch(dir: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Ref to exclude from a worktree's log so only its own commits remain. `None` (full history) when
-/// HEAD is detached, no default branch exists, or the worktree is on the default branch itself.
-fn log_base(wt: &Path) -> Option<String> {
+/// Default branch to compare a worktree against. `None` when HEAD is detached, no default branch
+/// exists, or the worktree is on the default branch itself.
+pub fn base_for(wt: &Path) -> Option<String> {
     let base = default_branch(wt)?;
     let out = run_ok(wt, &["symbolic-ref", "-q", "--short", "HEAD"]).ok()?;
     let current = String::from_utf8_lossy(&out).trim().to_string();
     let short_base = base.rsplit('/').next().unwrap_or(&base);
     (current != base && current != short_base).then_some(base)
+}
+
+/// Files that would conflict when merging the worktree's HEAD into its base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub base: String,
+    pub files: Vec<String>,
+}
+
+/// Dry-run merge via `git merge-tree` (git >= 2.38; never touches the index or working tree).
+/// `None` when clean, there is no base, or git cannot tell (e.g. too old).
+pub fn conflicts_with_base(wt: &Path) -> Option<Conflict> {
+    let base = base_for(wt)?;
+    let out = run(
+        wt,
+        &["merge-tree", "--write-tree", "--name-only", &base, "HEAD"],
+        &[0, 1],
+    )
+    .ok()?;
+    let files = parse_merge_tree(&String::from_utf8_lossy(&out));
+    (!files.is_empty()).then_some(Conflict { base, files })
+}
+
+/// Parses `merge-tree --write-tree --name-only` output: tree OID, conflicted paths, blank line, messages.
+fn parse_merge_tree(out: &str) -> Vec<String> {
+    let mut files: Vec<String> = out
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    files.dedup();
+    files
 }
 
 pub fn log(wt: &Path, skip: usize, count: usize) -> Result<Vec<Commit>> {
@@ -294,7 +327,7 @@ pub fn log(wt: &Path, skip: usize, count: usize) -> Result<Vec<Commit>> {
         &skip,
         "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%D%x1f%P%x1f%s%x1e",
     ];
-    let range = log_base(wt).map(|b| format!("{b}..HEAD"));
+    let range = base_for(wt).map(|b| format!("{b}..HEAD"));
     if let Some(r) = &range {
         args.push(r);
     }
@@ -483,6 +516,47 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn parses_merge_tree() {
+        assert!(parse_merge_tree("abc123\n").is_empty());
+        assert_eq!(
+            parse_merge_tree(
+                "abc123\na.txt\nb/c.txt\nb/c.txt\n\nAuto-merging a.txt\nCONFLICT (content)\n"
+            ),
+            vec!["a.txt", "b/c.txt"]
+        );
+    }
+
+    #[test]
+    fn detects_conflicts_with_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        sh(&main, &["init", "-q", "-b", "master"]);
+        std::fs::write(main.join("a.txt"), "one\n").unwrap();
+        std::fs::write(main.join("b.txt"), "b\n").unwrap();
+        sh(&main, &["add", "."]);
+        sh(&main, &["commit", "-q", "-m", "first"]);
+        let wt = tmp.path().join("wt");
+        sh(
+            &main,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+
+        // On the default branch itself: nothing to compare.
+        assert_eq!(conflicts_with_base(&main), None);
+
+        std::fs::write(wt.join("a.txt"), "feat\n").unwrap();
+        sh(&wt, &["commit", "-q", "-am", "feat change"]);
+        assert_eq!(conflicts_with_base(&wt), None);
+
+        std::fs::write(main.join("a.txt"), "master\n").unwrap();
+        sh(&main, &["commit", "-q", "-am", "master change"]);
+        let c = conflicts_with_base(&wt).unwrap();
+        assert_eq!(c.base, "master");
+        assert_eq!(c.files, vec!["a.txt"]);
     }
 
     #[test]

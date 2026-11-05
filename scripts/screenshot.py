@@ -128,6 +128,9 @@ def build_demo(base: Path) -> Path:
     write(fix / "src/routes/health.rs", "pub fn health() -> &'static str {\n    \"ok\"\n}\n\npub const TIMEOUT_MS: u64 = 500;\n")
     git(fix, "add", "-A", env=env)
     git(fix, "commit", "-q", "-m", "Lower health check timeout", env=env)
+    # main touches the same lines, so fix/health-timeout conflicts with it.
+    write(repo / "src/routes/health.rs", "pub fn health() -> &'static str {\n    \"ok\"\n}\n\npub const TIMEOUT_MS: u64 = 2000;\n")
+    commit("Raise health check timeout", 2, "Sam Lee")
     rl = base / "acme-rate-limit"
     write(rl / "src/limiter.rs", "pub struct Limiter;\n")
     git(rl, "add", "-A", env=env)

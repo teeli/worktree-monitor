@@ -7,7 +7,8 @@ commit history, side by side and updating in near-realtime.
 
 ## Features
 
-- **All worktrees as tabs.** The tab badge shows each worktree's number of uncommitted changes.
+- **All worktrees as tabs.** The tab badge shows each worktree's number of uncommitted changes, or `⚠N` when the branch would conflict with the default branch
+  (`origin/HEAD`, else `main`/`master`) in N files. The status line names the base branch. Requires git 2.38+.
 - **Changed files as a tree:** modified, added, deleted, renamed, untracked and conflicted. Directories are collapsible.
 - **Diff view** with old/new line numbers, hunk navigation that continues into adjacent files, and line selection.
 - **Commit list.** Select a commit to browse its files and diffs. Select *Working tree* to go back.

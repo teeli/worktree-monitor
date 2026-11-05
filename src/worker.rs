@@ -2,7 +2,7 @@
 //! Queued jobs are coalesced: repeated refreshes of the same thing collapse into one.
 
 use crate::app::AppEvent;
-use crate::git::{self, Commit, FileChange, Worktree};
+use crate::git::{self, Commit, Conflict, FileChange, Worktree};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,6 +18,9 @@ pub enum Job {
         wt: PathBuf,
         skip: usize,
         count: usize,
+    },
+    Conflicts {
+        wt: PathBuf,
     },
     CommitFiles {
         wt: PathBuf,
@@ -37,6 +40,7 @@ enum JobKey {
     Worktrees,
     Status(PathBuf),
     Log(PathBuf, usize),
+    Conflicts(PathBuf),
     CommitFiles,
     Diff,
 }
@@ -47,6 +51,7 @@ impl Job {
             Job::Worktrees => JobKey::Worktrees,
             Job::Status { wt } => JobKey::Status(wt.clone()),
             Job::Log { wt, skip, .. } => JobKey::Log(wt.clone(), *skip),
+            Job::Conflicts { wt } => JobKey::Conflicts(wt.clone()),
             // Only the latest file list / diff request matters.
             Job::CommitFiles { .. } => JobKey::CommitFiles,
             Job::Diff { .. } => JobKey::Diff,
@@ -65,6 +70,10 @@ pub enum GitResult {
         skip: usize,
         count: usize,
         res: Result<Vec<Commit>>,
+    },
+    Conflicts {
+        wt: PathBuf,
+        conflict: Option<Conflict>,
     },
     CommitFiles {
         wt: PathBuf,
@@ -125,6 +134,10 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
                 res,
             }
         }
+        Job::Conflicts { wt } => {
+            let conflict = git::conflicts_with_base(&wt);
+            GitResult::Conflicts { wt, conflict }
+        }
         Job::CommitFiles { wt, id, commit } => {
             let res = git::commit_files(&wt, &commit);
             GitResult::CommitFiles { wt, id, res }
@@ -157,11 +170,14 @@ mod tests {
             Job::Status { wt: b.clone() },
             Job::Worktrees,
             Job::Status { wt: a.clone() },
+            Job::Conflicts { wt: a.clone() },
+            Job::Conflicts { wt: a.clone() },
         ];
         let out = coalesce(jobs);
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 4);
         assert!(matches!(&out[0], Job::Status { wt } if *wt == b));
         assert!(matches!(&out[1], Job::Worktrees));
         assert!(matches!(&out[2], Job::Status { wt } if *wt == a));
+        assert!(matches!(&out[3], Job::Conflicts { wt } if *wt == a));
     }
 }
