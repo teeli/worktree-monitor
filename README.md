@@ -10,7 +10,7 @@ commit history, side by side and updating in near-realtime.
 - **All worktrees as tabs.** The tab badge shows each worktree's number of uncommitted changes, or `⚠N` when the branch would conflict with the default branch
   (`origin/HEAD`, else `main`/`master`) in N files. The status line names the base branch. Requires git 2.38+.
 - **Changed files as a tree:** modified, added, deleted, renamed, untracked and conflicted. Directories are collapsible.
-- **Diff view** with old/new line numbers, hunk navigation that continues into adjacent files, and line selection.
+- **Diff view** with old/new line numbers, hunk navigation that continues into adjacent files, line selection, and optional soft wrap (`w`).
 - **Commit list.** Select a commit to browse its files and diffs. Select *Working tree* to go back.
 - **Copy the file path to the clipboard,** with `:line` appended when a diff line is selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a 2-second polling fallback. Adding or removing worktrees updates
@@ -51,6 +51,7 @@ Press `?` in the app for the full list.
 | Diff | `j` `k` (also `}` `{`) | Next / previous hunk, continuing into adjacent files |
 | | `↓` `↑` | Move the line selection |
 | | `h` `l` / `←` `→` | Scroll horizontally |
+| | `w` | Toggle soft wrap (off by default) |
 | | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Half page / page / top / bottom |
 | | `Esc` | Clear line selection |
 | File tree | `Enter` / `Space` | Toggle directory (of the current file) |

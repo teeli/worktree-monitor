@@ -53,6 +53,7 @@ pub enum Action {
     ExpandRecursive,
     NextHunk,
     PrevHunk,
+    ToggleWrap,
     Escape,
 }
 
@@ -196,6 +197,7 @@ pub const BINDINGS: &[Binding] = &[
     ),
     b(Diff, &["g g", "Home"], A::Top, "gg  Home", "Go to top"),
     b(Diff, &["G", "End"], A::Bottom, "G  End", "Go to bottom"),
+    b(Diff, &["w"], A::ToggleWrap, "w", "Toggle soft wrap"),
     b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
     b(
         Tree,
