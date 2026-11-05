@@ -23,6 +23,8 @@ pub enum Job {
     Conflicts {
         wt: PathBuf,
         base: String,
+        /// (HEAD, base) commits this check is for; echoed back to discard stale results.
+        key: ConflictKey,
     },
     CommitFiles {
         wt: PathBuf,
@@ -36,6 +38,8 @@ pub enum Job {
         file: FileChange,
     },
 }
+
+pub type ConflictKey = (String, String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JobKey {
@@ -78,7 +82,8 @@ pub enum GitResult {
     },
     Conflicts {
         wt: PathBuf,
-        conflict: Option<Conflict>,
+        key: ConflictKey,
+        res: Result<Option<Conflict>>,
     },
     CommitFiles {
         wt: PathBuf,
@@ -147,9 +152,9 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
                 res,
             }
         }
-        Job::Conflicts { wt, base } => {
-            let conflict = git::conflicts_with_base(&wt, &base);
-            GitResult::Conflicts { wt, conflict }
+        Job::Conflicts { wt, base, key } => {
+            let res = git::conflicts_with_base(&wt, &base);
+            GitResult::Conflicts { wt, key, res }
         }
         Job::CommitFiles { wt, id, commit } => {
             let res = git::commit_files(&wt, &commit);
@@ -186,10 +191,12 @@ mod tests {
             Job::Conflicts {
                 wt: a.clone(),
                 base: "main".into(),
+                key: Default::default(),
             },
             Job::Conflicts {
                 wt: a.clone(),
                 base: "main".into(),
+                key: Default::default(),
             },
         ];
         let out = coalesce(jobs);

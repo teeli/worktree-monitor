@@ -318,19 +318,24 @@ pub struct Conflict {
 }
 
 /// Dry-run merge via `git merge-tree` (git >= 2.38; never touches the index or working tree).
-/// `None` when clean, there is no base, or git cannot tell (e.g. too old).
-pub fn conflicts_with_base(wt: &Path, base: &str) -> Option<Conflict> {
+/// `None` when clean; an error when git cannot tell (e.g. too old, or a transient failure).
+pub fn conflicts_with_base(wt: &Path, base: &str) -> Result<Option<Conflict>> {
     let out = run(
         wt,
         &["merge-tree", "--write-tree", "--name-only", base, "HEAD"],
         &[0, 1],
-    )
-    .ok()?;
-    let files = parse_merge_tree(&String::from_utf8_lossy(&out));
-    (!files.is_empty()).then(|| Conflict {
+    )?;
+    let out = String::from_utf8_lossy(&out);
+    // Exit code 1 means "conflicts" but also e.g. a bad revision; only the former prints a tree.
+    let tree = out.lines().next().unwrap_or_default();
+    if tree.is_empty() || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("git merge-tree: no result for {base}");
+    }
+    let files = parse_merge_tree(&out);
+    Ok((!files.is_empty()).then(|| Conflict {
         base: base.to_string(),
         files,
-    })
+    }))
 }
 
 /// Parses `merge-tree --write-tree --name-only` output: tree OID, conflicted paths, blank line, messages.
@@ -589,12 +594,13 @@ mod tests {
 
         std::fs::write(wt.join("a.txt"), "feat\n").unwrap();
         sh(&wt, &["commit", "-q", "-am", "feat change"]);
-        assert_eq!(conflicts_with_base(&wt, &base.name), None);
+        assert_eq!(conflicts_with_base(&wt, &base.name).unwrap(), None);
+        assert!(conflicts_with_base(&wt, "no-such-branch").is_err());
 
         std::fs::write(main.join("a.txt"), "master\n").unwrap();
         sh(&main, &["commit", "-q", "-am", "master change"]);
         assert_ne!(resolve_base(&main).unwrap().sha, base.sha);
-        let c = conflicts_with_base(&wt, &base.name).unwrap();
+        let c = conflicts_with_base(&wt, &base.name).unwrap().unwrap();
         assert_eq!(c.base, "master");
         assert_eq!(c.files, vec!["a.txt"]);
 

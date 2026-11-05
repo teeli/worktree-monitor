@@ -7,7 +7,7 @@ use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
 use crate::watcher::{self, FsWatcher};
-use crate::worker::{GitResult, Job};
+use crate::worker::{ConflictKey, GitResult, Job};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
@@ -54,7 +54,7 @@ pub struct WtState {
     /// Merge conflicts with the default branch, if any.
     pub conflict: Option<Conflict>,
     /// (HEAD, base) commits `conflict` was last requested for; skips identical merge-tree runs.
-    conflict_key: Option<(String, String)>,
+    conflict_key: Option<ConflictKey>,
 
     pub commits: Vec<Commit>,
     pub log_exhausted: bool,
@@ -88,9 +88,7 @@ pub struct WtState {
 impl WtState {
     fn new(info: Worktree) -> Self {
         let canon = std::fs::canonicalize(&info.path).unwrap_or_else(|_| info.path.clone());
-        let gitdir = git::gitdir(&info.path)
-            .and_then(|d| std::fs::canonicalize(d).ok())
-            .unwrap_or_default();
+        let gitdir = resolve_gitdir(&info.path);
         WtState {
             info,
             canon,
@@ -164,6 +162,13 @@ impl WtState {
     }
 }
 
+/// Canonical git directory of a worktree; empty when it cannot be read (yet).
+fn resolve_gitdir(wt: &Path) -> PathBuf {
+    git::gitdir(wt)
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .unwrap_or_default()
+}
+
 /// Screen regions from the last render, used for mouse hit-testing and page sizes.
 #[derive(Default)]
 pub struct HitAreas {
@@ -192,6 +197,8 @@ pub struct App {
     common_canon: PathBuf,
     /// Default branch, refreshed with the worktree list.
     base: Option<Base>,
+    /// Visible state changed outside a git result (which always redraws).
+    dirty: bool,
     ticks: u64,
     next_id: u64,
     clipboard: Clipboard,
@@ -227,6 +234,7 @@ impl App {
             watcher: None,
             common_canon,
             base: None,
+            dirty: false,
             ticks: 0,
             next_id: 1,
             clipboard: Clipboard::default(),
@@ -275,6 +283,8 @@ impl App {
         };
         if !st.info.exists() {
             st.error = Some("worktree directory is missing".into());
+            // No job, so no result will trigger the redraw.
+            self.dirty = true;
             return;
         }
         let wt = st.info.path.clone();
@@ -309,13 +319,13 @@ impl App {
             st.conflict_key = None;
             return;
         };
-        let key = Some((head, sha));
-        if st.conflict_key == key {
+        let key = (head, sha);
+        if st.conflict_key.as_ref() == Some(&key) {
             return;
         }
-        st.conflict_key = key;
+        st.conflict_key = Some(key.clone());
         let wt = st.info.path.clone();
-        self.send(Job::Conflicts { wt, base });
+        self.send(Job::Conflicts { wt, base, key });
     }
 
     /// Re-lists worktrees and refreshes every working tree. Log and conflicts follow once the
@@ -341,17 +351,18 @@ impl App {
             .map(|(m, e, _)| (m.as_str(), *e))
     }
 
-    /// Time until the current toast expires, if one is showing.
+    /// Time until the current toast expires (zero once it has), while one is set.
     fn toast_remaining(&self) -> Option<Duration> {
         self.toast
             .as_ref()
-            .and_then(|(_, _, t)| TOAST_TTL.checked_sub(t.elapsed()))
+            .map(|(_, _, t)| TOAST_TTL.saturating_sub(t.elapsed()))
     }
 
     // ---- events -------------------------------------------------------------
 
     /// Applies an event. Returns whether the screen needs redrawing; events that only queue
-    /// git jobs return `false`, their results redraw once they arrive.
+    /// git jobs return `false` (unless they changed state directly, see `dirty`), their
+    /// results redraw once they arrive.
     pub fn handle(&mut self, ev: AppEvent) -> bool {
         match ev {
             AppEvent::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.on_key(k),
@@ -361,7 +372,7 @@ impl App {
             AppEvent::Git(res) => self.on_git(res),
             AppEvent::Fs(paths) => {
                 self.on_fs(paths);
-                return false;
+                return std::mem::take(&mut self.dirty);
             }
             AppEvent::Tick => {
                 self.ticks += 1;
@@ -374,9 +385,10 @@ impl App {
                 } else {
                     self.refresh_status(self.active);
                 }
-                return false;
+                return std::mem::take(&mut self.dirty);
             }
         }
+        self.dirty = false;
         true
     }
 
@@ -387,9 +399,14 @@ impl App {
             let owner = if let Ok(rel) = p.strip_prefix(&self.common_canon) {
                 match classify_git_path(rel) {
                     GitPath::Ignore => None,
-                    GitPath::Index(dir) => {
+                    GitPath::Status(dir) => {
                         let gitdir = self.common_canon.join(dir);
-                        self.wts.iter().position(|w| w.gitdir == gitdir)
+                        let owner = self.wts.iter().position(|w| w.gitdir == gitdir);
+                        // Unknown git directory: refresh every status rather than miss it.
+                        if owner.is_none() {
+                            dirty.extend(0..self.wts.len());
+                        }
+                        owner
                     }
                     GitPath::Refs => {
                         refs = true;
@@ -452,9 +469,20 @@ impl App {
                     Err(e) => st.error = Some(format!("{e:#}")),
                 }
             }
-            GitResult::Conflicts { wt, conflict } => {
-                if let Some(i) = self.index_of(&wt) {
-                    self.wts[i].conflict = conflict;
+            GitResult::Conflicts { wt, key, res } => {
+                let Some(i) = self.index_of(&wt) else { return };
+                let st = &mut self.wts[i];
+                // HEAD or base moved (or the base no longer applies) since this was requested.
+                if st.conflict_key.as_ref() != Some(&key) {
+                    return;
+                }
+                match res {
+                    Ok(conflict) => st.conflict = conflict,
+                    Err(_) => {
+                        // Not memoized, so the next worktree refresh retries.
+                        st.conflict = None;
+                        st.conflict_key = None;
+                    }
                 }
             }
             GitResult::Log {
@@ -544,6 +572,10 @@ impl App {
         if same_set {
             for (info, st) in infos.into_iter().zip(&mut self.wts) {
                 st.info = info;
+                // The `.git` file of a new worktree may not have existed when first listed.
+                if st.gitdir.as_os_str().is_empty() {
+                    st.gitdir = resolve_gitdir(&st.info.path);
+                }
             }
             return;
         }
@@ -555,6 +587,9 @@ impl App {
                 Some(p) => {
                     let mut st = old.swap_remove(p);
                     st.info = info;
+                    if st.gitdir.as_os_str().is_empty() {
+                        st.gitdir = resolve_gitdir(&st.info.path);
+                    }
                     self.wts.push(st);
                 }
                 None => {
@@ -1172,37 +1207,34 @@ pub fn ensure_visible(offset: &mut usize, cursor: usize, height: usize) {
 
 /// What a change inside the git common directory affects.
 #[derive(Debug, PartialEq, Eq)]
-enum GitPath<'a> {
-    /// Objects, reflogs and fsmonitor cookies never change what we show by themselves.
+enum GitPath {
+    /// Everything not listed below: objects, reflogs, fsmonitor cookies, LFS temp files, hooks, …
+    /// An allowlist, because git commands (ours too) write all sorts of files here; reacting
+    /// to those would refresh in a loop.
     Ignore,
-    /// An index write: only the status of the worktree owning this git directory (relative).
-    Index(&'a Path),
-    /// Anything else (HEAD, refs, packed-refs, config, …): refresh everything.
+    /// Index or submodule HEAD write: only the status of the worktree owning this git
+    /// directory (relative to the common directory).
+    Status(PathBuf),
+    /// HEAD, refs, packed-refs: refresh everything.
     Refs,
 }
 
 /// Classifies `rel`, a path relative to the common git directory.
-fn classify_git_path(rel: &Path) -> GitPath<'_> {
+fn classify_git_path(rel: &Path) -> GitPath {
     let parts: Vec<_> = rel.iter().collect();
-    // Linked worktrees keep their HEAD, index and logs in `worktrees/<name>/`.
-    let inner = match parts.as_slice() {
-        [w, _, inner @ ..] if *w == "worktrees" => inner,
-        all => all,
+    // Linked worktrees keep their HEAD, index and submodules in `worktrees/<name>/`.
+    let (owner, inner): (PathBuf, _) = match parts.as_slice() {
+        [w, name, inner @ ..] if *w == "worktrees" => ([*w, *name].iter().collect(), inner),
+        all => (PathBuf::new(), all),
     };
     match inner {
-        [first, ..]
-            if *first == "objects"
-                || *first == "logs"
-                // With core.fsmonitor, every git command (ours too) writes cookies here.
-                || first.to_string_lossy().starts_with("fsmonitor--daemon") =>
-        {
-            GitPath::Ignore
-        }
-        // `index`, `index.lock`; the parent is the owning git directory.
-        [file] if file.to_string_lossy().starts_with("index") => {
-            GitPath::Index(rel.parent().unwrap_or(rel))
-        }
-        _ => GitPath::Refs,
+        // `index`, `index.lock`.
+        [file] if file.to_string_lossy().starts_with("index") => GitPath::Status(owner),
+        [file] if ["HEAD", "packed-refs"].iter().any(|f| *file == *f) => GitPath::Refs,
+        [first, _, ..] if *first == "refs" || *first == "reftable" => GitPath::Refs,
+        // A submodule commit or checkout changes the superproject's status.
+        [first, .., last] if *first == "modules" && *last == "HEAD" => GitPath::Status(owner),
+        _ => GitPath::Ignore,
     }
 }
 
@@ -1261,29 +1293,45 @@ mod tests {
 
     #[test]
     fn classifies_git_paths() {
-        fn c(p: &str) -> GitPath<'_> {
-            classify_git_path(Path::new(p))
+        let c = |p: &str| classify_git_path(Path::new(p));
+        let status = |p: &str| GitPath::Status(PathBuf::from(p));
+        for ignored in [
+            "objects/ab/cdef",
+            "logs/HEAD",
+            "worktrees/wt/logs/HEAD",
+            "fsmonitor--daemon/cookies/1-2",
+            "fsmonitor--daemon.ipc",
+            "worktrees/wt/fsmonitor--daemon/cookies/1-2",
+            "modules/sub/fsmonitor--daemon/cookies/1-2",
+            "modules/sub/index",
+            "lfs/tmp/abc",
+            "HEAD.lock",
+            "COMMIT_EDITMSG",
+            "FETCH_HEAD",
+            "config",
+            "refs",
+        ] {
+            assert_eq!(c(ignored), GitPath::Ignore, "{ignored}");
         }
-        assert_eq!(c("objects/ab/cdef"), GitPath::Ignore);
-        assert_eq!(c("logs/HEAD"), GitPath::Ignore);
-        assert_eq!(c("worktrees/wt/logs/HEAD"), GitPath::Ignore);
-        assert_eq!(c("fsmonitor--daemon/cookies/1-2"), GitPath::Ignore);
-        assert_eq!(c("fsmonitor--daemon.ipc"), GitPath::Ignore);
+        assert_eq!(c("index"), status(""));
+        assert_eq!(c("index.lock"), status(""));
+        assert_eq!(c("worktrees/wt/index"), status("worktrees/wt"));
+        assert_eq!(c("modules/sub/HEAD"), status(""));
         assert_eq!(
-            c("worktrees/wt/fsmonitor--daemon/cookies/1-2"),
-            GitPath::Ignore
+            c("worktrees/wt/modules/a/modules/b/HEAD"),
+            status("worktrees/wt")
         );
-        assert_eq!(c("index"), GitPath::Index(Path::new("")));
-        assert_eq!(c("index.lock"), GitPath::Index(Path::new("")));
-        assert_eq!(
-            c("worktrees/wt/index"),
-            GitPath::Index(Path::new("worktrees/wt"))
-        );
-        assert_eq!(c("HEAD"), GitPath::Refs);
-        assert_eq!(c("refs/heads/main"), GitPath::Refs);
-        assert_eq!(c("refs/heads/index"), GitPath::Refs);
-        assert_eq!(c("worktrees/wt/HEAD"), GitPath::Refs);
-        assert_eq!(c("packed-refs"), GitPath::Refs);
+        for refs in [
+            "HEAD",
+            "packed-refs",
+            "refs/heads/main",
+            "refs/heads/index",
+            "refs/remotes/origin/HEAD",
+            "reftable/tables.list",
+            "worktrees/wt/HEAD",
+        ] {
+            assert_eq!(c(refs), GitPath::Refs, "{refs}");
+        }
     }
 
     #[test]
