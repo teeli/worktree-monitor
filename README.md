@@ -13,7 +13,8 @@ commit history, side by side and updating in near-realtime.
 - **Diff view** with old/new line numbers, hunk navigation that continues into adjacent files, line selection, and optional soft wrap (`w`).
 - **Commit list.** Select a commit to browse its files and diffs. Select *Working tree* to go back.
 - **Copy the file path to the clipboard,** with `:line` appended when a diff line is selected. Uses OSC 52 over SSH.
-- **Live updates** from file system events, with a 2-second polling fallback. Adding or removing worktrees updates
+- **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
+  when file watching is unavailable). Adding or removing worktrees updates
   the tabs.
 - **Vim-style keys and mouse support:** click, wheel scrolling and tab clicks.
 - **Colors** follow your terminal's color scheme by default. A built-in Dracula theme is available.

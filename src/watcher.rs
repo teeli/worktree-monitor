@@ -1,7 +1,8 @@
 //! File system watching (debounced) plus a periodic tick as a fallback for missed events.
 
 use crate::app::AppEvent;
-use notify::{RecommendedWatcher, RecursiveMode};
+use anyhow::Context;
+use notify::{ErrorKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -15,17 +16,28 @@ pub struct FsWatcher {
     _debouncer: Debouncer<RecommendedWatcher>,
 }
 
-/// Watches every existing path recursively. Errors on individual paths are ignored
-/// (e.g. a worktree directory that was removed); the periodic tick still covers them.
+/// Watches every existing path recursively; missing paths (e.g. a removed worktree directory)
+/// are skipped. Fails when the OS runs out of watches (e.g. the inotify limit), so the caller
+/// falls back to polling instead of silently missing events.
 pub fn watch(paths: &[PathBuf], tx: Sender<AppEvent>) -> anyhow::Result<FsWatcher> {
     let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| {
-        if let Ok(events) = res {
-            let paths = events.into_iter().map(|e| e.path).collect();
-            let _ = tx.send(AppEvent::Fs(paths));
-        }
+        // Queue overflows arrive as path-less rescan events, which the debouncer drops;
+        // the periodic fallback refresh covers those.
+        let _ = tx.send(match res {
+            Ok(events) => AppEvent::Fs(events.into_iter().map(|e| e.path).collect()),
+            Err(e) => AppEvent::FsError {
+                out_of_watches: matches!(e.kind, ErrorKind::MaxFilesWatch),
+            },
+        });
     })?;
     for p in paths.iter().filter(|p| p.exists()) {
-        let _ = debouncer.watcher().watch(p, RecursiveMode::Recursive);
+        if let Err(e) = debouncer.watcher().watch(p, RecursiveMode::Recursive) {
+            // Other errors (e.g. an unreadable subdirectory) only affect part of the tree;
+            // the fallback refresh covers that.
+            if matches!(e.kind, ErrorKind::MaxFilesWatch) {
+                return Err(e).with_context(|| format!("watching {}", p.display()));
+            }
+        }
     }
     Ok(FsWatcher {
         _debouncer: debouncer,

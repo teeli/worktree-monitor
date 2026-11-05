@@ -2,24 +2,27 @@
 
 use crate::clipboard::Clipboard;
 use crate::diff::{self, Diff};
-use crate::git::{self, Commit, Conflict, FileChange, Repo, Worktree};
+use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
 use crate::watcher::{self, FsWatcher};
-use crate::worker::{GitResult, Job};
+use crate::worker::{ConflictKey, GitResult, Job};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 const LOG_PAGE: usize = 50;
-/// Every Nth tick also re-lists worktrees and refreshes inactive ones.
-const FULL_REFRESH_TICKS: u64 = 3;
+/// While file watching works, ticks are only a fallback: refresh everything every Nth tick.
+const FALLBACK_TICKS: u64 = 15;
+/// Without file watching, every Nth tick refreshes everything (other ticks the active worktree).
+const POLL_FULL_TICKS: u64 = 3;
 const TOAST_TTL: Duration = Duration::from_secs(3);
 const WHEEL_LINES: usize = 3;
 const HSCROLL_COLS: usize = 8;
@@ -29,6 +32,11 @@ pub enum AppEvent {
     Input(Event),
     Git(GitResult),
     Fs(Vec<PathBuf>),
+    /// The watcher failed and events may have been missed; when it ran out of watches,
+    /// parts of the tree are no longer watched at all.
+    FsError {
+        out_of_watches: bool,
+    },
     Tick,
 }
 
@@ -44,11 +52,15 @@ pub struct WtState {
     pub info: Worktree,
     /// Canonical path, for matching file system events.
     canon: PathBuf,
+    /// Canonical git directory (holds this worktree's index and HEAD).
+    gitdir: PathBuf,
     pub changes: Vec<FileChange>,
     pub loaded: bool,
     pub error: Option<String>,
     /// Merge conflicts with the default branch, if any.
     pub conflict: Option<Conflict>,
+    /// (HEAD, base) commits `conflict` was last requested for; skips identical merge-tree runs.
+    conflict_key: Option<ConflictKey>,
 
     pub commits: Vec<Commit>,
     pub log_exhausted: bool,
@@ -82,13 +94,16 @@ pub struct WtState {
 impl WtState {
     fn new(info: Worktree) -> Self {
         let canon = std::fs::canonicalize(&info.path).unwrap_or_else(|_| info.path.clone());
+        let gitdir = resolve_gitdir(&info.path);
         WtState {
             info,
             canon,
+            gitdir,
             changes: Vec::new(),
             loaded: false,
             error: None,
             conflict: None,
+            conflict_key: None,
             commits: Vec::new(),
             log_exhausted: false,
             log_loading: false,
@@ -110,6 +125,15 @@ impl WtState {
             diff_offset: 0,
             diff_hscroll: 0,
             diff_sel: None,
+        }
+    }
+
+    /// Takes fresh info from the worktree list.
+    fn set_info(&mut self, info: Worktree) {
+        self.info = info;
+        // The `.git` file of a new worktree may not have existed when first listed.
+        if self.gitdir.as_os_str().is_empty() {
+            self.gitdir = resolve_gitdir(&self.info.path);
         }
     }
 
@@ -153,6 +177,13 @@ impl WtState {
     }
 }
 
+/// Canonical git directory of a worktree; empty when it cannot be read (yet).
+fn resolve_gitdir(wt: &Path) -> PathBuf {
+    git::gitdir(wt)
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .unwrap_or_default()
+}
+
 /// Screen regions from the last render, used for mouse hit-testing and page sizes.
 #[derive(Default)]
 pub struct HitAreas {
@@ -179,6 +210,10 @@ pub struct App {
     events: Sender<AppEvent>,
     watcher: Option<FsWatcher>,
     common_canon: PathBuf,
+    /// Default branch, refreshed with the worktree list.
+    base: Option<Base>,
+    /// Visible state changed outside a git result (which always redraws).
+    dirty: bool,
     ticks: u64,
     next_id: u64,
     clipboard: Clipboard,
@@ -213,6 +248,8 @@ impl App {
             events,
             watcher: None,
             common_canon,
+            base: None,
+            dirty: false,
             ticks: 0,
             next_id: 1,
             clipboard: Clipboard::default(),
@@ -248,35 +285,79 @@ impl App {
         }
     }
 
-    fn refresh_wt(&mut self, i: usize) {
+    /// Base branch the worktree's log and conflicts are compared against.
+    fn base_of(&self, i: usize) -> Option<String> {
+        let base = self.base.as_ref()?;
+        git::base_for(self.wts.get(i)?.info.branch.as_deref(), &base.name).map(String::from)
+    }
+
+    /// Re-reads the working tree state; only file edits and index writes need this.
+    fn refresh_status(&mut self, i: usize) {
         let Some(st) = self.wts.get_mut(i) else {
             return;
         };
         if !st.info.exists() {
             st.error = Some("worktree directory is missing".into());
+            // No job, so no result will trigger the redraw.
+            self.dirty = true;
             return;
         }
         let wt = st.info.path.clone();
-        let count = st.commits.len().max(LOG_PAGE);
-        self.send(Job::Status { wt: wt.clone() });
-        self.send(Job::Conflicts { wt: wt.clone() });
-        if i == self.active {
-            self.send(Job::Log { wt, skip: 0, count });
-        }
+        self.send(Job::Status { wt });
     }
 
+    fn refresh_log(&mut self, i: usize) {
+        let base = self.base_of(i);
+        let Some(st) = self.wts.get(i).filter(|st| st.info.exists()) else {
+            return;
+        };
+        let job = Job::Log {
+            wt: st.info.path.clone(),
+            skip: 0,
+            count: st.commits.len().max(LOG_PAGE),
+            base,
+        };
+        self.send(job);
+    }
+
+    /// Requests a conflict check unless HEAD and base are unchanged since the last one.
+    fn refresh_conflicts(&mut self, i: usize) {
+        let base = self.base_of(i);
+        let base_sha = self.base.as_ref().map(|b| b.sha.clone());
+        let Some(st) = self.wts.get_mut(i) else {
+            return;
+        };
+        let (Some(base), Some(head), Some(sha), true) =
+            (base, st.info.head.clone(), base_sha, st.info.exists())
+        else {
+            st.conflict = None;
+            st.conflict_key = None;
+            return;
+        };
+        let key = (head, sha);
+        if st.conflict_key.as_ref() == Some(&key) {
+            return;
+        }
+        st.conflict_key = Some(key.clone());
+        let wt = st.info.path.clone();
+        self.send(Job::Conflicts { wt, base, key });
+    }
+
+    /// Re-lists worktrees and refreshes every working tree. Log and conflicts follow once the
+    /// worktree list (with current branches and HEADs) arrives, see `merge_worktrees`.
     fn refresh_all(&mut self) {
         self.send(Job::Worktrees);
         // Active first so it is served before the others.
-        self.refresh_wt(self.active);
+        self.refresh_status(self.active);
         let active = self.active;
         for i in (0..self.wts.len()).filter(|&i| i != active) {
-            self.refresh_wt(i);
+            self.refresh_status(i);
         }
     }
 
     fn notify(&mut self, msg: String, error: bool) {
         self.toast = Some((msg, error, Instant::now()));
+        self.dirty = true;
     }
 
     pub fn visible_toast(&self) -> Option<(&str, bool)> {
@@ -286,61 +367,114 @@ impl App {
             .map(|(m, e, _)| (m.as_str(), *e))
     }
 
+    /// Time until the current toast expires (zero once it has), while one is set.
+    fn toast_remaining(&self) -> Option<Duration> {
+        self.toast
+            .as_ref()
+            .map(|(_, _, t)| TOAST_TTL.saturating_sub(t.elapsed()))
+    }
+
     // ---- events -------------------------------------------------------------
 
-    pub fn handle(&mut self, ev: AppEvent) {
+    /// Applies an event. Returns whether the screen needs redrawing, i.e. whether anything set
+    /// `dirty`. Input and git results always do; events that only queue git jobs don't, the
+    /// results redraw once they arrive.
+    pub fn handle(&mut self, ev: AppEvent) -> bool {
         match ev {
-            AppEvent::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.on_key(k),
-            AppEvent::Input(Event::Mouse(m)) => self.on_mouse(m),
-            AppEvent::Input(_) => {}
-            AppEvent::Git(res) => self.on_git(res),
+            AppEvent::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved => {}
+            AppEvent::Input(ev) => {
+                self.dirty = true;
+                match ev {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+                    Event::Mouse(m) => self.on_mouse(m),
+                    _ => {}
+                }
+            }
+            AppEvent::Git(res) => {
+                self.dirty = true;
+                self.on_git(res);
+            }
             AppEvent::Fs(paths) => self.on_fs(paths),
+            AppEvent::FsError { out_of_watches } => {
+                if out_of_watches && self.watcher.is_some() {
+                    self.watcher = None;
+                    self.notify("File watching hit the OS limit, polling only".into(), true);
+                }
+                self.refresh_all();
+            }
             AppEvent::Tick => {
                 self.ticks += 1;
-                if self.ticks.is_multiple_of(FULL_REFRESH_TICKS) {
+                if self.watcher.is_some() {
+                    if self.ticks.is_multiple_of(FALLBACK_TICKS) {
+                        self.refresh_all();
+                    }
+                } else if self.ticks.is_multiple_of(POLL_FULL_TICKS) {
                     self.refresh_all();
                 } else {
-                    self.refresh_wt(self.active);
+                    self.refresh_status(self.active);
                 }
             }
         }
+        std::mem::take(&mut self.dirty)
     }
 
     fn on_fs(&mut self, paths: Vec<PathBuf>) {
         let mut dirty = HashSet::new();
-        let mut everything = false;
+        let mut refs = false;
         for p in paths {
-            if let Ok(rel) = p.strip_prefix(&self.common_canon) {
-                // Object writes and reflogs never change what we show by themselves.
-                if !(rel.starts_with("objects") || rel.starts_with("logs")) {
-                    everything = true;
+            let owner = if let Ok(rel) = p.strip_prefix(&self.common_canon) {
+                match classify_git_path(rel) {
+                    GitPath::Ignore => None,
+                    GitPath::Status(dir) => {
+                        let gitdir = self.common_canon.join(dir);
+                        let owner = self.wts.iter().position(|w| w.gitdir == gitdir);
+                        // Unknown git directory: refresh every status rather than miss it.
+                        if owner.is_none() {
+                            dirty.extend(0..self.wts.len());
+                        }
+                        owner
+                    }
+                    GitPath::Refs => {
+                        refs = true;
+                        None
+                    }
                 }
-                continue;
-            }
-            let owner = self
-                .wts
-                .iter()
-                .enumerate()
-                .filter(|(_, w)| p.starts_with(&w.canon))
-                .max_by_key(|(_, w)| w.canon.as_os_str().len())
-                .map(|(i, _)| i);
+            } else {
+                self.wts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| p.starts_with(&w.canon))
+                    .max_by_key(|(_, w)| w.canon.as_os_str().len())
+                    .map(|(i, _)| i)
+            };
             if let Some(i) = owner {
                 dirty.insert(i);
             }
         }
-        if everything {
+        // A ref move (commit, checkout, reset) can change any worktree's status too.
+        if refs {
             self.refresh_all();
         } else {
             for i in dirty {
-                self.refresh_wt(i);
+                self.refresh_status(i);
             }
         }
     }
 
     fn on_git(&mut self, res: GitResult) {
         match res {
-            GitResult::Worktrees(Ok(infos)) => self.merge_worktrees(infos),
-            GitResult::Worktrees(Err(e)) => self.notify(format!("{e:#}"), true),
+            GitResult::Worktrees {
+                res: Ok(infos),
+                base,
+            } => {
+                self.base = base;
+                self.merge_worktrees(infos);
+                self.refresh_log(self.active);
+                for i in 0..self.wts.len() {
+                    self.refresh_conflicts(i);
+                }
+            }
+            GitResult::Worktrees { res: Err(e), .. } => self.notify(format!("{e:#}"), true),
             GitResult::Status { wt, res } => {
                 let active = self.active;
                 let Some(i) = self.index_of(&wt) else { return };
@@ -361,9 +495,20 @@ impl App {
                     Err(e) => st.error = Some(format!("{e:#}")),
                 }
             }
-            GitResult::Conflicts { wt, conflict } => {
-                if let Some(i) = self.index_of(&wt) {
-                    self.wts[i].conflict = conflict;
+            GitResult::Conflicts { wt, key, res } => {
+                let Some(i) = self.index_of(&wt) else { return };
+                let st = &mut self.wts[i];
+                // HEAD or base moved (or the base no longer applies) since this was requested.
+                if st.conflict_key.as_ref() != Some(&key) {
+                    return;
+                }
+                match res {
+                    Ok(conflict) => st.conflict = conflict,
+                    Err(_) => {
+                        // Not memoized, so the next worktree refresh retries.
+                        st.conflict = None;
+                        st.conflict_key = None;
+                    }
                 }
             }
             GitResult::Log {
@@ -452,7 +597,7 @@ impl App {
                 .all(|(a, b)| a.path == b.info.path);
         if same_set {
             for (info, st) in infos.into_iter().zip(&mut self.wts) {
-                st.info = info;
+                st.set_info(info);
             }
             return;
         }
@@ -463,7 +608,7 @@ impl App {
             match old.iter().position(|w| w.info.path == info.path) {
                 Some(p) => {
                     let mut st = old.swap_remove(p);
-                    st.info = info;
+                    st.set_info(info);
                     self.wts.push(st);
                 }
                 None => {
@@ -474,11 +619,8 @@ impl App {
         }
         self.active = active_path.and_then(|p| self.index_of(&p)).unwrap_or(0);
         self.rewatch();
-        for &i in &added {
-            self.refresh_wt(i);
-        }
-        if !added.contains(&self.active) {
-            self.refresh_wt(self.active);
+        for i in added {
+            self.refresh_status(i);
         }
     }
 
@@ -589,7 +731,8 @@ impl App {
     fn switch_worktree(&mut self, i: usize) {
         if i < self.wts.len() && i != self.active {
             self.active = i;
-            self.refresh_wt(i);
+            self.refresh_status(i);
+            self.refresh_log(i);
         }
     }
 
@@ -640,6 +783,9 @@ impl App {
             Action::CopyRelative => self.copy_path(false),
             Action::CopyAbsolute => self.copy_path(true),
             Action::Refresh => {
+                for st in &mut self.wts {
+                    st.conflict_key = None;
+                }
                 self.refresh_all();
                 self.notify("Refreshing…".into(), false);
             }
@@ -720,6 +866,7 @@ impl App {
     }
 
     fn maybe_load_more(&mut self) {
+        let base = self.base_of(self.active);
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
@@ -731,6 +878,7 @@ impl App {
                 wt: st.info.path.clone(),
                 skip: st.commits.len(),
                 count: LOG_PAGE,
+                base,
             };
             self.send(job);
         }
@@ -1076,19 +1224,87 @@ pub fn ensure_visible(offset: &mut usize, cursor: usize, height: usize) {
     }
 }
 
-pub fn run(terminal: &mut DefaultTerminal, mut app: App, rx: Receiver<AppEvent>) -> Result<()> {
-    loop {
-        terminal.draw(|f| crate::ui::draw(f, &mut app))?;
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(ev) => {
-                app.handle(ev);
-                for ev in rx.try_iter() {
-                    app.handle(ev);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+/// What a change inside the git common directory affects.
+#[derive(Debug, PartialEq, Eq)]
+enum GitPath {
+    /// Everything not listed below: objects, reflogs, fsmonitor cookies, LFS temp files, hooks, …
+    /// An allowlist, because git commands (ours too) write all sorts of files here; reacting
+    /// to those would refresh in a loop.
+    Ignore,
+    /// Index or submodule ref write: only the status of the worktree owning this git
+    /// directory (relative to the common directory).
+    Status(PathBuf),
+    /// HEAD, refs, packed-refs, config(.worktree), info/, worktree gitdir: refresh everything.
+    Refs,
+}
+
+/// Classifies `rel`, a path relative to the common git directory.
+fn classify_git_path(rel: &Path) -> GitPath {
+    let parts: Vec<_> = rel.iter().collect();
+    // Linked worktrees keep their HEAD, index and submodules in `worktrees/<name>/`.
+    let (owner, inner): (PathBuf, _) = match parts.as_slice() {
+        [w, name, inner @ ..] if *w == "worktrees" => ([*w, *name].iter().collect(), inner),
+        all => (PathBuf::new(), all),
+    };
+    let is = |p: &OsStr, names: &[&str]| names.iter().any(|n| p == *n);
+    match inner {
+        // `index`, `index.lock`.
+        [file] if file.to_string_lossy().starts_with("index") => GitPath::Status(owner),
+        // `gitdir` is rewritten by `git worktree move`; `config` and `info/` (exclude,
+        // sparse-checkout) change what status reports.
+        [file]
+            if is(
+                file,
+                &["HEAD", "packed-refs", "gitdir", "config", "config.worktree"],
+            ) =>
+        {
+            GitPath::Refs
         }
+        [first, _, ..] if is(first, &["refs", "reftable", "info"]) => GitPath::Refs,
+        // A submodule commit or checkout changes the superproject's status.
+        [first, rest @ ..] if *first == "modules" => {
+            let refs = rest.iter().any(|p| *p == "refs") && !rest.iter().any(|p| *p == "logs");
+            if refs || rest.last().is_some_and(|l| is(l, &["HEAD", "packed-refs"])) {
+                GitPath::Status(owner)
+            } else {
+                GitPath::Ignore
+            }
+        }
+        _ => GitPath::Ignore,
+    }
+}
+
+pub fn run(terminal: &mut DefaultTerminal, mut app: App, rx: Receiver<AppEvent>) -> Result<()> {
+    let mut redraw = true;
+    loop {
+        if redraw {
+            terminal.draw(|f| crate::ui::draw(f, &mut app))?;
+        }
+        // Sleep until the next event, or until a visible toast expires.
+        let ev = match app.toast_remaining() {
+            Some(t) => match rx.recv_timeout(t) {
+                Ok(ev) => Some(ev),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(ev) => Some(ev),
+                Err(_) => break,
+            },
+        };
+        redraw = match ev {
+            Some(ev) => {
+                let mut redraw = app.handle(ev);
+                for ev in rx.try_iter() {
+                    redraw |= app.handle(ev);
+                }
+                redraw
+            }
+            None => {
+                app.toast = None;
+                true
+            }
+        };
         if app.quit {
             break;
         }
@@ -1109,6 +1325,58 @@ mod tests {
         assert_eq!(off, 1);
         ensure_visible(&mut off, 0, 10);
         assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn classifies_git_paths() {
+        let c = |p: &str| classify_git_path(Path::new(p));
+        let status = |p: &str| GitPath::Status(PathBuf::from(p));
+        for ignored in [
+            "objects/ab/cdef",
+            "logs/HEAD",
+            "worktrees/wt/logs/HEAD",
+            "fsmonitor--daemon/cookies/1-2",
+            "fsmonitor--daemon.ipc",
+            "worktrees/wt/fsmonitor--daemon/cookies/1-2",
+            "modules/sub/fsmonitor--daemon/cookies/1-2",
+            "modules/sub/index",
+            "lfs/tmp/abc",
+            "HEAD.lock",
+            "COMMIT_EDITMSG",
+            "FETCH_HEAD",
+            "refs",
+            "worktrees/wt/locked",
+            "modules/sub/logs/refs/heads/main",
+            "modules/sub/objects/ab/cd",
+        ] {
+            assert_eq!(c(ignored), GitPath::Ignore, "{ignored}");
+        }
+        assert_eq!(c("index"), status(""));
+        assert_eq!(c("index.lock"), status(""));
+        assert_eq!(c("worktrees/wt/index"), status("worktrees/wt"));
+        assert_eq!(c("modules/sub/HEAD"), status(""));
+        assert_eq!(c("modules/sub/refs/heads/main"), status(""));
+        assert_eq!(c("modules/sub/packed-refs"), status(""));
+        assert_eq!(
+            c("worktrees/wt/modules/a/modules/b/HEAD"),
+            status("worktrees/wt")
+        );
+        for refs in [
+            "HEAD",
+            "packed-refs",
+            "refs/heads/main",
+            "refs/heads/index",
+            "refs/remotes/origin/HEAD",
+            "reftable/tables.list",
+            "worktrees/wt/HEAD",
+            "worktrees/wt/gitdir",
+            "config",
+            "worktrees/wt/config.worktree",
+            "info/exclude",
+            "worktrees/wt/info/sparse-checkout",
+        ] {
+            assert_eq!(c(refs), GitPath::Refs, "{refs}");
+        }
     }
 
     #[test]
