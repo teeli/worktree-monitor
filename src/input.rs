@@ -25,6 +25,11 @@ impl LineInput {
         }
     }
 
+    /// Byte offset of the cursor in `text`.
+    pub fn cursor_byte(&self) -> usize {
+        self.byte(self.cursor)
+    }
+
     fn byte(&self, char_idx: usize) -> usize {
         self.text
             .char_indices()
@@ -40,6 +45,21 @@ impl LineInput {
         let at = self.byte(self.cursor);
         self.text.insert_str(at, s);
         self.cursor += s.chars().count();
+    }
+
+    /// Inserts pasted text on the single line: line breaks become spaces, tabs are expanded
+    /// (as in diffs) and other control characters dropped.
+    pub fn paste(&mut self, s: &str) {
+        let mut clean = String::with_capacity(s.len());
+        for c in s.replace("\r\n", "\n").chars() {
+            match c {
+                '\n' | '\r' => clean.push(' '),
+                '\t' => clean.push_str("    "),
+                c if c.is_control() => {}
+                c => clean.push(c),
+            }
+        }
+        self.insert(&clean);
     }
 
     /// Removes the chars in `from..to`, leaving the cursor at `from`.
@@ -123,6 +143,12 @@ mod tests {
         i.on_key(&ctrl('u'));
         assert_eq!((i.text.as_str(), i.cursor), (" ", 0));
         assert_eq!(i.on_key(&key(KeyCode::Enter)), Outcome::Submit);
+        let mut p = LineInput::new("ä");
+        p.paste("a\r\nb\tc\u{7}d\n");
+        assert_eq!(p.text, "äa b    cd ");
+        assert_eq!(p.cursor_byte(), p.text.len());
+        p.cursor = 1;
+        assert_eq!(p.cursor_byte(), 2);
         assert_eq!(i.on_key(&key(KeyCode::Esc)), Outcome::Cancel);
     }
 }

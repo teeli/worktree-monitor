@@ -3,7 +3,7 @@
 use crate::diff::{Diff, LineKind};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -234,49 +234,66 @@ pub fn line_no(diff: &Diff, idx: usize, side: Side) -> Option<u32> {
 /// line if its text is unchanged, else on the nearest line with the same text. Range comments
 /// whose first line can't be found are shown as single-line comments.
 pub fn anchor(comments: &[Comment], diff: &Diff, file: &str, commit: Option<&str>) -> Anchors {
-    let mut out = Anchors::default();
-    for (ci, c) in comments.iter().enumerate() {
-        if c.file != file || c.commit.as_deref() != commit {
-            continue;
+    let mine: Vec<(usize, LinePos)> = comments
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.file == file && c.commit.as_deref() == commit)
+        .map(|(ci, c)| {
+            let end = LinePos {
+                side: c.side,
+                line: c.line,
+                text: c.line_text.clone(),
+            };
+            (ci, end)
+        })
+        .collect();
+    // Exact matches first, so a drifted comment can't take another one's unchanged line.
+    let mut ends: Vec<Option<usize>> = vec![None; mine.len()];
+    let mut taken = HashSet::new();
+    for exact in [true, false] {
+        for ((_, pos), end) in mine.iter().zip(&mut ends) {
+            if end.is_none() {
+                *end = locate(diff, pos, 0..diff.lines.len(), exact, |i| {
+                    !taken.contains(&i)
+                });
+                taken.extend(*end);
+            }
         }
-        let pos = LinePos {
-            side: c.side,
-            line: c.line,
-            text: c.line_text.clone(),
-        };
-        let Some(end) = locate(diff, &pos, 0..diff.lines.len(), |i| {
-            !out.by_line.contains_key(&i)
-        }) else {
+    }
+    let mut out = Anchors::default();
+    for ((ci, _), end) in mine.into_iter().zip(ends) {
+        let Some(end) = end else {
             out.outdated += 1;
             continue;
         };
-        let start = c
+        let start = comments[ci]
             .start
             .as_ref()
-            .and_then(|s| locate(diff, s, 0..end, |_| true))
+            .and_then(|s| locate(diff, s, 0..end, false, |_| true))
             .unwrap_or(end);
         out.by_line.insert(end, Anchor { comment: ci, start });
     }
     out
 }
 
-/// The diff line within `range` matching `pos`: exactly, else the nearest one with its text.
+/// The diff line within `range` with `pos`'s text: at its line number when `exact`, else
+/// the nearest one.
 fn locate(
     diff: &Diff,
     pos: &LinePos,
     range: std::ops::Range<usize>,
+    exact: bool,
     free: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let lines = || {
-        range
-            .clone()
-            .filter_map(|i| Some((i, line_no(diff, i, pos.side)?)))
-            .filter(|&(i, _)| diff.lines[i].text == pos.text && free(i))
+    let mut lines = range
+        .filter_map(|i| Some((i, line_no(diff, i, pos.side)?)))
+        .filter(|&(i, _)| diff.lines[i].text == pos.text && free(i));
+    let found = if exact {
+        lines.find(|&(_, n)| n == pos.line)
+    } else {
+        lines.min_by_key(|&(_, n)| n.abs_diff(pos.line))
     };
-    lines()
-        .find(|&(_, n)| n == pos.line)
-        .or_else(|| lines().min_by_key(|&(_, n)| n.abs_diff(pos.line)))
-        .map(|(i, _)| i)
+    found.map(|(i, _)| i)
 }
 
 #[cfg(test)]
@@ -391,6 +408,21 @@ mod tests {
         assert_eq!(at(a), vec![(2, 1), (3, 0), (4, 2)]);
         assert_eq!(at(anchor(&cs, &d, "f", Some("s"))), vec![(5, 4)]);
         assert_eq!(anchor(&cs, &d, "other", None).total(), 0);
+    }
+
+    #[test]
+    fn exact_matches_win_over_drifted_ones() {
+        // Lines: 0 hunk, 1 ` }` (new 1), 2 `+x` (new 2), 3 ` }` (new 3).
+        let d = diff::parse("@@ -1,2 +1,3 @@\n }\n+x\n }\n");
+        // The drifted comment comes first and its nearest `}` is new 3, which the second
+        // comment is exactly on.
+        let cs = vec![
+            comment(1, Side::New, 4, "}", None),
+            comment(2, Side::New, 3, "}", None),
+        ];
+        let a = anchor(&cs, &d, "f", None);
+        assert_eq!(a.by_line[&3].comment, 1);
+        assert_eq!(a.by_line[&1].comment, 0);
     }
 
     #[test]

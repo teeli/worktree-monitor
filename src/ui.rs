@@ -316,9 +316,15 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let comments = match (st.anchors.total(), st.anchors.outdated) {
                 (0, _) => String::new(),
-                (1, 0) => " · 1 comment".to_string(),
-                (n, 0) => format!(" · {n} comments"),
-                (n, o) => format!(" · {n} comments ({o} outdated)"),
+                (n, o) => {
+                    let s = if n == 1 { "" } else { "s" };
+                    let outdated = if o > 0 {
+                        format!(" ({o} outdated)")
+                    } else {
+                        String::new()
+                    };
+                    format!(" · {n} comment{s}{outdated}")
+                }
             };
             let wrapped = if wrap { " · wrap" } else { "" };
             format!(" {}{stats}{comments}{wrapped} ", file.path)
@@ -365,13 +371,15 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = |st: &WtState, i: usize| line_rows(st, input, wrap, text_w, width, i);
 
     let mut off = st.diff_offset.min(len - 1);
+    // Without wrapping, don't scroll past the point where the last line reaches the bottom.
+    let mut max = len - 1;
     if !wrap {
-        // Don't scroll past the point where the last line reaches the bottom.
-        let (mut max, mut total) = (len, 0);
-        while max > 0 && total < h {
-            max -= 1;
-            total += rows(st, max);
+        let (mut first, mut total) = (len, 0);
+        while first > 0 && total < h {
+            first -= 1;
+            total += rows(st, first);
         }
+        max = first;
         off = off.min(max);
     }
     if let Some(sel) = input.map(|i| i.at).or(st.diff_sel) {
@@ -510,7 +518,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         f.set_cursor_position((inner.x + x, inner.y + y as u16));
     }
 
-    let scroll_range = if wrap { len - 1 } else { len.saturating_sub(h) };
+    // Fitting the selection may have scrolled a little further than `max`.
+    let scroll_range = max.max(st.diff_offset);
     if scroll_range > 0 {
         let mut state = ScrollbarState::new(scroll_range).position(st.diff_offset);
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -563,11 +572,7 @@ impl<'a> Note<'a> {
 fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Option<Note<'a>> {
     if let Some(input) = input.filter(|inp| inp.at == i) {
         let e = &input.edit;
-        let cursor = e
-            .text
-            .char_indices()
-            .nth(e.cursor)
-            .map_or(e.text.len(), |(b, _)| b);
+        let cursor = e.cursor_byte();
         return Some(Note {
             text: &e.text,
             cursor: Some(cursor),
