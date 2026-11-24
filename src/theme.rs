@@ -36,6 +36,10 @@ pub struct Theme {
     pub renamed: Style,
     pub conflict: Style,
     pub error: Style,
+    /// Bar and box of a diff comment.
+    pub comment: Style,
+    /// Text of a saved diff comment.
+    pub comment_text: Style,
 }
 
 impl Theme {
@@ -76,6 +80,9 @@ impl Theme {
             renamed: s.fg(Color::Cyan),
             conflict: s.fg(Color::Red).add_modifier(Modifier::BOLD),
             error: s.fg(Color::Red),
+            // Muted tan (256-color): visible without competing with the diff colors.
+            comment: s.fg(Color::Indexed(137)),
+            comment_text: s,
         }
     }
 
@@ -116,6 +123,9 @@ impl Theme {
             renamed: s.fg(CYAN),
             conflict: s.fg(RED).add_modifier(Modifier::BOLD),
             error: s.fg(RED),
+            // The spec's Comment token; comments are italic.
+            comment: s.fg(COMMENT),
+            comment_text: s.add_modifier(Modifier::ITALIC),
         }
     }
 

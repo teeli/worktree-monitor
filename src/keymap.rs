@@ -38,6 +38,8 @@ pub enum Action {
     Refresh,
     Down,
     Up,
+    ExtendDown,
+    ExtendUp,
     HalfDown,
     HalfUp,
     PageDown,
@@ -54,6 +56,7 @@ pub enum Action {
     NextHunk,
     PrevHunk,
     ToggleWrap,
+    Comment,
     Escape,
 }
 
@@ -177,6 +180,14 @@ pub const BINDINGS: &[Binding] = &[
     ),
     b(Diff, &["Down"], A::Down, "↓", "Next line"),
     b(Diff, &["Up"], A::Up, "↑", "Previous line"),
+    b(
+        Diff,
+        &["S-Down"],
+        A::ExtendDown,
+        "Shift-↓ ↑",
+        "Extend line selection (to comment on a range)",
+    ),
+    b(Diff, &["S-Up"], A::ExtendUp, "", ""),
     b(Diff, &["h", "Left"], A::Left, "h  ←", "Scroll left"),
     b(Diff, &["l", "Right"], A::Right, "l  →", "Scroll right"),
     b(Diff, &["C-d"], A::HalfDown, "Ctrl-d", "Half page down"),
@@ -198,6 +209,13 @@ pub const BINDINGS: &[Binding] = &[
     b(Diff, &["g g", "Home"], A::Top, "gg  Home", "Go to top"),
     b(Diff, &["G", "End"], A::Bottom, "G  End", "Go to bottom"),
     b(Diff, &["w"], A::ToggleWrap, "w", "Toggle soft wrap"),
+    b(
+        Diff,
+        &["c"],
+        A::Comment,
+        "c",
+        "Comment on selected line (edit/delete if commented)",
+    ),
     b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
     b(
         Tree,
@@ -244,6 +262,8 @@ pub fn key_name(ev: &KeyEvent) -> Option<String> {
         KeyCode::Tab => "Tab".into(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Esc".into(),
+        KeyCode::Up if shift => "S-Up".into(),
+        KeyCode::Down if shift => "S-Down".into(),
         KeyCode::Up => "Up".into(),
         KeyCode::Down => "Down".into(),
         KeyCode::Left if shift => "S-Left".into(),
@@ -295,6 +315,7 @@ mod tests {
             Lookup::Action(Action::CollapseRecursive)
         ));
         assert!(matches!(lookup("Down"), Lookup::Action(Action::Down)));
+        assert!(matches!(lookup("S-Up"), Lookup::Action(Action::ExtendUp)));
         assert!(matches!(
             lookup("g t"),
             Lookup::Action(Action::NextWorktree)
@@ -302,6 +323,7 @@ mod tests {
         assert!(matches!(lookup("g g"), Lookup::Action(Action::Top)));
         assert!(matches!(lookup("z"), Lookup::Action(Action::FoldAll)));
         assert!(matches!(lookup("Z"), Lookup::Action(Action::UnfoldAll)));
+        assert!(matches!(lookup("c"), Lookup::Action(Action::Comment)));
         assert!(matches!(lookup("Tab"), Lookup::None));
         assert!(matches!(lookup("E"), Lookup::None));
         assert!(matches!(lookup("3"), Lookup::Action(Action::Worktree(2))));

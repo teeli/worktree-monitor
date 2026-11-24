@@ -1,6 +1,6 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
-use crate::app::App;
+use crate::app::{App, CommentInput, WtState};
 use crate::diff::{Diff, LineKind};
 use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
 use crate::theme::Theme;
@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 12;
@@ -314,8 +314,14 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 format!(" +{} -{}", st.diff.added, st.diff.removed)
             };
+            let comments = match (st.anchors.total(), st.anchors.outdated) {
+                (0, _) => String::new(),
+                (1, 0) => " · 1 comment".to_string(),
+                (n, 0) => format!(" · {n} comments"),
+                (n, o) => format!(" · {n} comments ({o} outdated)"),
+            };
             let wrapped = if wrap { " · wrap" } else { "" };
-            format!(" {}{stats}{wrapped} ", file.path)
+            format!(" {}{stats}{comments}{wrapped} ", file.path)
         }
         None => " Diff ".to_string(),
     };
@@ -323,6 +329,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hit.diff = inner;
+    let input = app.input.as_ref();
     let st = &mut app.wts[app.active];
 
     if let Some(err) = &st.diff_error {
@@ -351,23 +358,53 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     let h = inner.height as usize;
     let len = st.diff.lines.len();
-    if !wrap {
-        clamp_offset(&mut st.diff_offset, len, h);
-    }
-    let num_w = st.diff.max_line_no().to_string().len().max(3);
-    let gutter_w = num_w * 2 + 2;
-    let text_w = (inner.width as usize).saturating_sub(gutter_w + 1);
-    let num = |n: Option<u32>| n.map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
-    let sel_style = theme.diff_sel;
-    let hscroll = st.diff_hscroll;
+    let num_w = num_width(&st.diff);
+    let gutter_w = gutter_width(&st.diff);
+    let text_w = text_width(&st.diff, inner.width);
+    let width = inner.width as usize;
+    let rows = |st: &WtState, i: usize| line_rows(st, input, wrap, text_w, width, i);
 
-    let build = |gutter: String, marker: &'static str, text: &str, style: Style, selected: bool| {
+    let mut off = st.diff_offset.min(len - 1);
+    if !wrap {
+        // Don't scroll past the point where the last line reaches the bottom.
+        let (mut max, mut total) = (len, 0);
+        while max > 0 && total < h {
+            max -= 1;
+            total += rows(st, max);
+        }
+        off = off.min(max);
+    }
+    if let Some(sel) = input.map(|i| i.at).or(st.diff_sel) {
+        // Scroll so the whole selected (or edited) line, with its comment, fits if it can.
+        off = off.min(sel);
+        let mut total: usize = (off..=sel).map(|i| rows(st, i)).sum();
+        while total > h && off < sel {
+            total -= rows(st, off);
+            off += 1;
+        }
+    }
+    st.diff_offset = off;
+    let st = &*st;
+
+    let num = |n: Option<u32>| n.map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
+    let build = |gutter: String,
+                 mark: Option<Style>,
+                 marker: &'static str,
+                 text: &str,
+                 style: Style,
+                 selected: bool| {
         let gutter_style = if selected {
             theme.gutter_sel
         } else {
             theme.dim
         };
-        let mut spans = vec![Span::styled(gutter, gutter_style)];
+        let mut spans = vec![
+            match mark {
+                Some(style) => Span::styled("│", style),
+                None => Span::raw(" "),
+            },
+            Span::styled(gutter, gutter_style),
+        ];
         spans.extend(fit_spans(
             vec![
                 Span::styled(marker, style),
@@ -377,7 +414,11 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         ));
         // Span styles carry their own bg (e.g. Dracula), so the selection
         // is patched onto the finished row (gutter and padding included).
-        let row_style = if selected { sel_style } else { Style::new() };
+        let row_style = if selected {
+            theme.diff_sel
+        } else {
+            Style::new()
+        };
         patch_row(spans, row_style)
     };
     let line_style = |kind: LineKind| match kind {
@@ -389,54 +430,85 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         LineKind::Meta => ("", theme.dim),
     };
 
-    let lines: Vec<Line> = if wrap {
-        st.diff_offset = st.diff_offset.min(len - 1);
-        if let Some(sel) = st.diff_sel {
-            // Scroll so the whole selected line fits, if it can.
-            st.diff_offset = st.diff_offset.min(sel);
-            let rows = |i: usize| wrap_ranges(&st.diff.lines[i].text, text_w).len();
-            let mut total: usize = (st.diff_offset..=sel).map(rows).sum();
-            while total > h && st.diff_offset < sel {
-                total -= rows(st.diff_offset);
-                st.diff_offset += 1;
-            }
+    let sel = st.sel_range();
+    let mut out = Vec::with_capacity(h);
+    let mut cursor = None;
+    for (i, l) in st.diff.lines.iter().enumerate().skip(off) {
+        if out.len() >= h {
+            break;
         }
-        let mut out = Vec::with_capacity(h);
-        for (i, l) in st.diff.lines.iter().enumerate().skip(st.diff_offset) {
+        let (marker, style) = line_style(l.kind);
+        let selected = sel.as_ref().is_some_and(|r| r.contains(&i));
+        let note = note_at(st, input, i);
+        // A bar along the lines a comment covers, running into its box below the last one.
+        let being_written = input.is_some_and(|inp| inp.at == i || selected && i < inp.at);
+        let mark = if being_written {
+            Some(theme.popup_border)
+        } else if note.is_some() || st.anchors.in_range(i) {
+            Some(theme.comment)
+        } else {
+            None
+        };
+        let chunks = if wrap {
+            wrap_ranges(&l.text, text_w)
+        } else {
+            vec![skip_cols(&l.text, st.diff_hscroll)]
+        };
+        for (k, chunk) in chunks.into_iter().enumerate() {
             if out.len() >= h {
                 break;
             }
-            let (marker, style) = line_style(l.kind);
-            let selected = st.diff_sel == Some(i);
-            for (k, chunk) in wrap_ranges(&l.text, text_w).into_iter().enumerate() {
-                if out.len() >= h {
-                    break;
-                }
-                out.push(if k == 0 {
-                    let gutter = format!("{} {} ", num(l.old), num(l.new));
-                    build(gutter, marker, chunk, style, selected)
-                } else {
-                    build(" ".repeat(gutter_w), " ", chunk, style, selected)
-                });
-            }
-        }
-        out
-    } else {
-        st.diff
-            .lines
-            .iter()
-            .enumerate()
-            .skip(st.diff_offset)
-            .take(h)
-            .map(|(i, l)| {
-                let (marker, style) = line_style(l.kind);
+            out.push(if k == 0 {
                 let gutter = format!("{} {} ", num(l.old), num(l.new));
-                let text = skip_cols(&l.text, hscroll);
-                build(gutter, marker, text, style, st.diff_sel == Some(i))
-            })
-            .collect()
-    };
-    f.render_widget(Paragraph::new(lines), inner);
+                build(gutter, mark, marker, chunk, style, selected)
+            } else {
+                build(" ".repeat(gutter_w - 1), mark, " ", chunk, style, selected)
+            });
+        }
+        let Some(note) = note else { continue };
+        let editing = note.cursor.is_some();
+        let frame = if editing {
+            theme.popup_border
+        } else {
+            theme.comment
+        };
+        // A full-width box open on the right: rules above and below separate it from the code.
+        let rule = |corner: &str| {
+            let rule = format!("{corner}{}", "─".repeat(width.saturating_sub(1)));
+            Line::from(fit_spans(vec![Span::styled(rule, frame)], width))
+        };
+        let row = |text: String, style: Style| {
+            let spans = vec![Span::styled("│ ", frame), Span::styled(text, style)];
+            Line::from(fit_spans(spans, width))
+        };
+        let body = note.rows(width);
+        let at = note.cursor_at(&body);
+        let mut rows = vec![rule("├")];
+        for (k, text) in body.into_iter().enumerate() {
+            if at.is_some_and(|(r, _)| r == k) && out.len() + rows.len() < h {
+                cursor = at.map(|(_, c)| (2 + c, out.len() + rows.len()));
+            }
+            let style = if editing {
+                theme.base
+            } else {
+                theme.comment_text
+            };
+            rows.push(row(text.to_string(), style));
+        }
+        if editing {
+            rows.push(row(
+                "Enter save · Esc cancel · empty deletes".into(),
+                theme.dim,
+            ));
+        }
+        rows.push(rule("└"));
+        out.extend(rows.into_iter().take(h - out.len()));
+    }
+    f.render_widget(Paragraph::new(out), inner);
+    if let Some((x, y)) = cursor {
+        let x = (x as u16).min(inner.width.saturating_sub(1));
+        f.set_cursor_position((inner.x + x, inner.y + y as u16));
+    }
 
     let scroll_range = if wrap { len - 1 } else { len.saturating_sub(h) };
     if scroll_range > 0 {
@@ -454,6 +526,89 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// Text shown below a diff line: its comment, or the comment being edited there.
+struct Note<'a> {
+    text: &'a str,
+    /// Byte offset of the input cursor while editing.
+    cursor: Option<usize>,
+}
+
+impl<'a> Note<'a> {
+    /// Wrapped text rows (after the `│ ` bar) in a pane `width` columns wide.
+    fn rows(&self, width: usize) -> Vec<&'a str> {
+        wrap_ranges(self.text, width.saturating_sub(2))
+    }
+
+    /// Screen rows: the text, the key hint while editing, and the rules above and below.
+    fn height(&self, width: usize) -> usize {
+        self.rows(width).len() + usize::from(self.cursor.is_some()) + 2
+    }
+
+    /// Row and column of the cursor within `rows` (consecutive slices of the text).
+    fn cursor_at(&self, rows: &[&str]) -> Option<(usize, usize)> {
+        let b = self.cursor?;
+        let mut start = 0;
+        for (r, row) in rows.iter().enumerate() {
+            if b < start + row.len() || r + 1 == rows.len() {
+                return Some((r, self.text[start..b].width()));
+            }
+            start += row.len();
+        }
+        None
+    }
+}
+
+fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Option<Note<'a>> {
+    if let Some(input) = input.filter(|inp| inp.at == i) {
+        let e = &input.edit;
+        let cursor = e
+            .text
+            .char_indices()
+            .nth(e.cursor)
+            .map_or(e.text.len(), |(b, _)| b);
+        return Some(Note {
+            text: &e.text,
+            cursor: Some(cursor),
+        });
+    }
+    let ci = st.anchors.by_line.get(&i)?;
+    Some(Note {
+        text: &st.comments.comments.get(ci.comment)?.body,
+        cursor: None,
+    })
+}
+
+/// Screen rows of diff line `i`: the line itself (wrapped or not) and the note below it.
+fn line_rows(
+    st: &WtState,
+    input: Option<&CommentInput>,
+    wrap: bool,
+    text_w: usize,
+    width: usize,
+    i: usize,
+) -> usize {
+    let line = if wrap {
+        wrap_ranges(&st.diff.lines[i].text, text_w).len()
+    } else {
+        1
+    };
+    line + note_at(st, input, i).map_or(0, |n| n.height(width))
+}
+
+fn num_width(diff: &Diff) -> usize {
+    diff.max_line_no().to_string().len().max(3)
+}
+
+/// Comment marker, old and new line numbers, each followed by a space except the marker.
+fn gutter_width(diff: &Diff) -> usize {
+    num_width(diff) * 2 + 3
+}
+
+/// Columns left for diff text after the gutter and the +/- marker.
+fn text_width(diff: &Diff, inner_width: u16) -> usize {
+    (inner_width as usize).saturating_sub(gutter_width(diff) + 1)
 }
 
 /// Splits `text` into rows of at most `width` display columns, preferring to break after
@@ -485,19 +640,25 @@ pub fn wrap_ranges(text: &str, width: usize) -> Vec<&str> {
     }
 }
 
-/// Maps a screen row (relative to the diff pane) to the diff line drawn there when wrapping.
+/// Maps a screen row (relative to the diff pane) to the diff line drawn there.
 /// Returns `diff.lines.len()` when the row is past the end.
-pub fn line_at_row(diff: &Diff, offset: usize, rel: usize, inner_width: u16) -> usize {
-    let num_w = diff.max_line_no().to_string().len().max(3);
-    let text_w = (inner_width as usize).saturating_sub(num_w * 2 + 3);
+pub fn line_at_row(st: &WtState, wrap: bool, rel: usize, inner_width: u16) -> usize {
+    let text_w = text_width(&st.diff, inner_width);
+    row_to_line(st.diff_offset, st.diff.lines.len(), rel, |i| {
+        line_rows(st, None, wrap, text_w, inner_width as usize, i)
+    })
+}
+
+/// The line among `offset..len` covering screen row `rel`, given each line's row count.
+fn row_to_line(offset: usize, len: usize, rel: usize, rows: impl Fn(usize) -> usize) -> usize {
     let mut row = 0;
-    for (i, l) in diff.lines.iter().enumerate().skip(offset) {
-        row += wrap_ranges(&l.text, text_w).len();
+    for i in offset..len {
+        row += rows(i);
         if rel < row {
             return i;
         }
     }
-    diff.lines.len()
+    len
 }
 
 fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
@@ -743,6 +904,34 @@ mod tests {
         assert_eq!(text, "ab  ");
         assert_eq!(skip_cols("hello", 2), "llo");
         assert_eq!(skip_cols("hi", 5), "");
+    }
+
+    #[test]
+    fn maps_rows_to_lines() {
+        let rows = |i: usize| [3, 2, 1, 4][i];
+        assert_eq!(row_to_line(1, 4, 0, rows), 1);
+        assert_eq!(row_to_line(1, 4, 1, rows), 1);
+        assert_eq!(row_to_line(1, 4, 2, rows), 2);
+        assert_eq!(row_to_line(1, 4, 6, rows), 3);
+        assert_eq!(row_to_line(1, 4, 7, rows), 4);
+    }
+
+    #[test]
+    fn places_note_cursor() {
+        let note = |text, cursor| Note {
+            text,
+            cursor: Some(cursor),
+        };
+        // Width 7 → 5 columns of note text after the bar.
+        let n = note("abcd efgh", 5);
+        let rows = n.rows(7);
+        assert_eq!(rows, vec!["abcd ", "efgh"]);
+        assert_eq!(n.cursor_at(&rows), Some((1, 0)));
+        assert_eq!(n.height(7), 5);
+        let n = note("abcd efgh", 9);
+        assert_eq!(n.cursor_at(&n.rows(7)), Some((1, 4)));
+        let n = note("", 0);
+        assert_eq!(n.cursor_at(&n.rows(7)), Some((0, 0)));
     }
 
     #[test]
