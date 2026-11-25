@@ -23,7 +23,7 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
   `?` help popup).
 - **Releases:** use the `create-release` skill (`.claude/skills/create-release/SKILL.md`). Keep it in sync with
   `.github/workflows/release.yml`.
-- **Check wtm comments in code review.** Every code review of a worktree (including `/code-review`) starts with
-  the `review-comments` skill (`.claude/skills/review-comments/SKILL.md`): address each comment and report its
-  outcome. Keep the skill in sync with the comment file location and format (`src/comments.rs`,
-  `schema/comments.schema.json`).
+- **Check wtm comments in code review.** Every code review of a worktree (including `/code-review`) runs the
+  `review-comments` skill (`.claude/skills/review-comments/SKILL.md`) and reports the open wtm comments with its
+  findings; change code for them only when asked to address them. Keep the skill and its `wtm-comments.sh` in
+  sync with the comment file location and format (`src/comments.rs`, `schema/comments.schema.json`).
