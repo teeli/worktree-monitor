@@ -32,7 +32,24 @@ commit history, side by side and updating in near-realtime.
 
 ## Install
 
-Requires `git` and a Rust toolchain (`rustup`).
+Requires `git` 2.38+.
+
+### Prebuilt binaries
+
+Download the archive for your platform from [Releases](https://github.com/teeli/worktree-monitor/releases)
+(macOS and Linux, arm64 and x86_64), extract it and put `wtm` somewhere on your `PATH`:
+
+```sh
+tar -xzf wtm-vX.Y.Z-<target>.tar.gz
+install wtm-vX.Y.Z-<target>/wtm ~/.local/bin/
+```
+
+Each archive has a `.sha256` file next to it (`shasum -a 256 -c wtm-vX.Y.Z-<target>.tar.gz.sha256`). The macOS
+binaries are not signed; if Gatekeeper blocks `wtm`, run `xattr -d com.apple.quarantine ~/.local/bin/wtm`.
+
+### From source
+
+Requires a Rust toolchain (`rustup`).
 
 ```sh
 cargo install --path .
@@ -87,3 +104,27 @@ uv run scripts/screenshot.py   # regenerate docs/screenshot.png
 `scripts/screenshot.py` builds `wtm` and creates a throwaway demo repository with several worktrees. It drives the
 app in a pseudo-terminal and renders the screen to `docs/screenshot.png`. Regenerate the screenshot whenever a change
 affects what the UI looks like.
+
+CI (`.github/workflows/ci.yml`) runs formatting, clippy, tests (Linux and macOS), rustdoc and actionlint on every
+pull request and push to `main`.
+
+## Releasing
+
+Versions follow [semver](https://semver.org). Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
+builds the binaries and publishes a GitHub Release with generated notes. The tag must match the `version` in
+`Cargo.toml` and point to a commit on `main`; tags with a pre-release suffix (`v1.0.0-rc.1`) become pre-releases.
+
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock`, via `cargo check`) in a PR and merge it.
+2. Tag `main` and push the tag:
+
+   ```sh
+   git fetch origin
+   git tag -a vX.Y.Z -m vX.Y.Z origin/main
+   git push origin vX.Y.Z
+   ```
+
+In Claude Code, the `create-release` skill walks through these steps and verifies the result.
+
+## License
+
+[MIT](LICENSE)

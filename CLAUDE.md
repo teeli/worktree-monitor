@@ -21,3 +21,5 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
   deletions).
 - Keep the README's key table in sync with `src/keymap.rs` (`BINDINGS` is the single source of truth for the
   `?` help popup).
+- **Releases:** use the `create-release` skill (`.claude/skills/create-release/SKILL.md`). Keep it in sync with
+  `.github/workflows/release.yml`.
