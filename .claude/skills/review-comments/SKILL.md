@@ -1,64 +1,59 @@
 ---
 name: review-comments
-description: Read the wtm line comments left on the current worktree and report or address the ones not yet handled. Use as part of every code review, or when asked to check or handle wtm comments.
+description: Read the open wtm line comments of the current worktree and report or address them, closing handled ones. Use as part of every code review, or when asked to check or handle wtm comments.
 ---
 
 # Review wtm comments
 
-wtm stores line comments per worktree outside the repo, as JSON described by `schema/comments.schema.json`.
-They are the user's review feedback on the worktree's changes. wtm owns the file: never edit or delete it.
+wtm comments are the user's line-by-line review feedback on the worktree's changes. Read and close them only
+through the `wtm comments` CLI (`src/cli.rs`; README "Comments from the command line"), never by editing the
+comment file.
 
-wtm has no way to close a comment, so handled comments are tracked in a log of our own: `wtm-handled-comments`
-in the worktree's git dir. It is never committed; for a linked worktree it is removed with the worktree, for the
-main checkout it stays in the repo's `.git/`. Each line is `<id>\t<updated>\t<outcome>`. A comment counts as
-handled only while its `updated` matches, so a comment edited in wtm comes back.
-
-`wtm-comments.sh` (next to this file, needs `jq`) finds both files on every call, from any directory inside the
-worktree. Its path logic mirrors `state_dir()` and `file_name()` in `src/comments.rs`.
+Run it as `wtm comments …` if the installed `wtm` has that subcommand (`wtm comments --help` succeeds), else as
+`cargo run -q -- comments …` from inside the worktree. It finds the worktree from any subdirectory.
 
 ## 1. List the open comments
 
 ```sh
-.claude/skills/review-comments/wtm-comments.sh list
+wtm comments list --json
 ```
 
-"no wtm comments" or "no open wtm comments (N handled)": report that and stop. Otherwise each comment prints as:
+`[]`: report "no open wtm comments" and stop. Otherwise each element is a comment object of
+`schema/comments.schema.json`, with `id` as a string (use it verbatim; never parse it as a number):
 
-```
-[<id>	<updated>] <file>:<line or start-end> (<side>, <commit or "working tree">)
-  first: <first line of a range>
-  line: <last (or only) line>
-  <body>
-```
-
-- `side`: `new`, or `old` for a line that exists only in the old file (a deleted line). A range spanning both
-  prints `old-new`: the first line is on the old side, the last on the new side.
-- `commit`: the commit the line was viewed in; "working tree" means uncommitted changes.
+- `file`, `line`, `line_text`: the commented (last) line; `start` (`line`, `text`, `side`) is the first line of
+  a range.
+- `side`: `new`, or `old` for a line that exists only in the old file (a deleted line). `start.side` can differ.
+- `commit`: the commit the line was viewed in; `null` means uncommitted changes.
+- `body`: the feedback.
 
 ## 2. Find the code each comment refers to
 
-Line numbers may have drifted. Find the lines by their text in the file as of the commit
+Line numbers may have drifted. Find the lines by their text in the file as of `commit`
 (`git show <commit>:<file>`), or in the working tree, then locate them in the current state of the branch.
 
 ## 3. Report or address
 
 - **Review only** (e.g. `/code-review`, or reviewing without being asked to change code): report each open
-  comment as a finding with your assessment. Change no code and record nothing.
+  comment as a finding with your assessment. Change no code and close nothing.
 - **Asked to address them:** treat each body as reviewer feedback: make the change, explain why no change is
   needed, or ask when it is ambiguous. A question gets an answer. Follow the repo rules in `CLAUDE.md` for any
   change (worktree, checks, screenshot).
 
-## 4. Record and report
+## 4. Close and report
 
-Record a comment once its outcome is final, copying the id and updated printed in step 1:
+Close a comment once its outcome is final:
 
 ```sh
-.claude/skills/review-comments/wtm-comments.sh done <id> <updated> "<outcome>"
+wtm comments close <ID>... --by claude
 ```
 
 - `fixed`: only after the fix is kept (committed, or accepted by the user), not when the edit is made.
-- `not changed (<reason>)` / `answered: <answer>`: after reporting it.
-- An open question: don't record it, so it comes back next time.
+- `not changed (<reason>)` / `answered: <answer>`: after reporting it. The CLI stores no note, so the report is
+  the only record of the reason.
+- An open question: leave it open.
+
+A wrong close is undone with `wtm comments reopen <ID>...`; the user editing a comment's text reopens it too.
 
 Report one line per comment, before or alongside other review findings:
 

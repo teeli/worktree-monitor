@@ -25,5 +25,5 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
   `.github/workflows/release.yml`.
 - **Check wtm comments in code review.** Every code review of a worktree (including `/code-review`) runs the
   `review-comments` skill (`.claude/skills/review-comments/SKILL.md`) and reports the open wtm comments with its
-  findings; change code for them only when asked to address them. Keep the skill and its `wtm-comments.sh` in
-  sync with the comment file location and format (`src/comments.rs`, `schema/comments.schema.json`).
+  findings; change code for them only when asked to address them. Keep the skill in sync with the
+  `wtm comments` CLI (`src/cli.rs`) and `schema/comments.schema.json`.
