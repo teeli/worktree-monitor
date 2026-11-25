@@ -220,6 +220,37 @@ impl Anchors {
     }
 }
 
+/// Indices of `comments` in display order: working tree first, then by commit in log order
+/// (`rank` gives a commit's position in the log), then commits not in the log by age; within
+/// each, by file and line.
+pub fn order(comments: &[Comment], rank: impl Fn(&str) -> Option<usize>) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..comments.len()).collect();
+    idx.sort_by_cached_key(|&i| {
+        let c = &comments[i];
+        let group = match c.commit.as_deref() {
+            None => (0, 0, 0),
+            Some(sha) => match rank(sha) {
+                Some(r) => (1, r, 0),
+                None => (2, 0, c.created),
+            },
+        };
+        (group, c.file.clone(), c.line)
+    });
+    idx
+}
+
+/// Position after/before `cur` in a list of `len`; from outside the list (`None`) the first or
+/// last one. `None` past the ends.
+pub fn step(len: usize, cur: Option<usize>, forward: bool) -> Option<usize> {
+    let next = match (cur, forward) {
+        (Some(c), true) => c + 1,
+        (Some(c), false) => c.checked_sub(1)?,
+        (None, true) => 0,
+        (None, false) => len.checked_sub(1)?,
+    };
+    (next < len).then_some(next)
+}
+
 /// Line number of a commentable diff line on `side`.
 pub fn line_no(diff: &Diff, idx: usize, side: Side) -> Option<u32> {
     let l = diff.lines.get(idx)?;
@@ -384,6 +415,37 @@ mod tests {
         assert!(broken.error.is_some());
         assert!(broken.upsert(comment(3, Side::New, 1, "x", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn orders_comments() {
+        let mut cs = vec![
+            comment(1, Side::New, 9, "x", Some("old")),
+            comment(2, Side::New, 5, "x", Some("gone2")),
+            comment(3, Side::New, 2, "x", None),
+            comment(4, Side::New, 1, "x", Some("new")),
+            comment(5, Side::New, 1, "x", Some("gone1")),
+            comment(6, Side::New, 1, "x", None),
+            comment(7, Side::New, 1, "x", Some("old")),
+        ];
+        cs[1].created = 2;
+        cs[4].created = 1;
+        cs[6].file = "e".into();
+        let log = ["new", "old"];
+        let o = order(&cs, |sha| log.iter().position(|s| *s == sha));
+        let ids: Vec<u64> = o.into_iter().map(|i| cs[i].id).collect();
+        assert_eq!(ids, vec![6, 3, 4, 7, 1, 5, 2]);
+    }
+
+    #[test]
+    fn steps_through_list() {
+        assert_eq!(step(3, None, true), Some(0));
+        assert_eq!(step(3, None, false), Some(2));
+        assert_eq!(step(3, Some(1), true), Some(2));
+        assert_eq!(step(3, Some(2), true), None);
+        assert_eq!(step(3, Some(0), false), None);
+        assert_eq!(step(0, None, true), None);
+        assert_eq!(step(0, None, false), None);
     }
 
     #[test]

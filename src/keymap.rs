@@ -8,6 +8,7 @@ pub enum Section {
     General,
     Worktrees,
     Diff,
+    Comments,
     Tree,
 }
 
@@ -17,6 +18,7 @@ impl Section {
             Section::General => "General",
             Section::Worktrees => "Worktrees & history",
             Section::Diff => "Diff",
+            Section::Comments => "Comments",
             Section::Tree => "File tree",
         }
     }
@@ -57,6 +59,9 @@ pub enum Action {
     PrevHunk,
     ToggleWrap,
     Comment,
+    ToggleComments,
+    NextComment,
+    PrevComment,
     Escape,
 }
 
@@ -87,7 +92,7 @@ const fn b(
 }
 
 use Action as A;
-use Section::{Diff, General, Tree, Worktrees};
+use Section::{Comments, Diff, General, Tree, Worktrees};
 
 pub const BINDINGS: &[Binding] = &[
     b(General, &["q", "C-c"], A::Quit, "q  Ctrl-c", "Quit"),
@@ -209,14 +214,35 @@ pub const BINDINGS: &[Binding] = &[
     b(Diff, &["g g", "Home"], A::Top, "gg  Home", "Go to top"),
     b(Diff, &["G", "End"], A::Bottom, "G  End", "Go to bottom"),
     b(Diff, &["w"], A::ToggleWrap, "w", "Toggle soft wrap"),
+    b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
     b(
-        Diff,
+        Comments,
         &["c"],
         A::Comment,
         "c",
         "Comment on selected line (edit/delete if commented)",
     ),
-    b(Diff, &["Esc"], A::Escape, "Esc", "Clear line selection"),
+    b(
+        Comments,
+        &["C"],
+        A::ToggleComments,
+        "C",
+        "Toggle the comments pane",
+    ),
+    b(
+        Comments,
+        &["C-n"],
+        A::NextComment,
+        "Ctrl-n",
+        "Jump to next comment",
+    ),
+    b(
+        Comments,
+        &["C-p"],
+        A::PrevComment,
+        "Ctrl-p",
+        "Jump to previous comment",
+    ),
     b(
         Tree,
         &["Enter", "Space"],
@@ -244,7 +270,7 @@ pub const BINDINGS: &[Binding] = &[
 
 /// Mouse help shown alongside key bindings.
 pub const MOUSE_HELP: &[(&str, &str)] = &[
-    ("Click", "Select tab / file / diff line / commit"),
+    ("Click", "Select tab / file / diff line / commit / comment"),
     ("Wheel", "Scroll pane under cursor"),
 ];
 
@@ -324,6 +350,12 @@ mod tests {
         assert!(matches!(lookup("z"), Lookup::Action(Action::FoldAll)));
         assert!(matches!(lookup("Z"), Lookup::Action(Action::UnfoldAll)));
         assert!(matches!(lookup("c"), Lookup::Action(Action::Comment)));
+        assert!(matches!(
+            lookup("C"),
+            Lookup::Action(Action::ToggleComments)
+        ));
+        assert!(matches!(lookup("C-n"), Lookup::Action(Action::NextComment)));
+        assert!(matches!(lookup("C-p"), Lookup::Action(Action::PrevComment)));
         assert!(matches!(lookup("Tab"), Lookup::None));
         assert!(matches!(lookup("E"), Lookup::None));
         assert!(matches!(lookup("3"), Lookup::Action(Action::Worktree(2))));
