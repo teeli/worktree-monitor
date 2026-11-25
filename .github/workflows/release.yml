@@ -80,7 +80,7 @@ jobs:
         run: |
           name="wtm-$GITHUB_REF_NAME-$TARGET"
           mkdir -p "staging/$name" dist
-          cp "target/$TARGET/release/wtm" README.md "staging/$name/"
+          cp "target/$TARGET/release/wtm" README.md LICENSE "staging/$name/"
           tar -czf "dist/$name.tar.gz" -C staging "$name"
           cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4

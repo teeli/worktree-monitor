@@ -124,3 +124,7 @@ builds the binaries and publishes a GitHub Release with generated notes. The tag
    ```
 
 In Claude Code, the `create-release` skill walks through these steps and verifies the result.
+
+## License
+
+[MIT](LICENSE)
