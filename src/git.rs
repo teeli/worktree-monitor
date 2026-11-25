@@ -465,6 +465,9 @@ fn pathspec(file: &FileChange) -> Vec<&str> {
     v
 }
 
+/// Commits searched for the lines of a committed working tree comment.
+const MAX_HISTORY: usize = 50;
+
 fn cap(mut out: Vec<u8>) -> String {
     let truncated = out.len() > MAX_DIFF_BYTES;
     out.truncate(MAX_DIFF_BYTES);
@@ -510,23 +513,26 @@ pub fn commit_diff(wt: &Path, commit: &Commit, file: &FileChange) -> Result<Stri
     Ok(cap(run_ok(wt, &args)?))
 }
 
-/// Commits in `since..HEAD` touching `file`, oldest first, each with its patch for `file`.
+/// The first `MAX_HISTORY` commits in `since..HEAD` touching `file`, oldest first, each with
+/// its patch for `file` (capped like other diffs).
 pub fn file_history(wt: &Path, since: &str, file: &str) -> Result<Vec<(String, String)>> {
     let range = format!("{since}..HEAD");
-    let out = run_ok(
-        wt,
-        &[
-            "log",
-            "--reverse",
-            "--no-ext-diff",
-            "-p",
-            "--format=%x1e%H",
-            &range,
-            "--",
-            file,
-        ],
-    )?;
-    Ok(parse_history(&String::from_utf8_lossy(&out)))
+    let out = run_ok(wt, &["rev-list", "--reverse", &range, "--", file])?;
+    let out = String::from_utf8_lossy(&out);
+    let shas: Vec<&str> = out.split_whitespace().take(MAX_HISTORY).collect();
+    if shas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "log",
+        "--no-walk=unsorted",
+        "--no-ext-diff",
+        "-p",
+        "--format=%x1e%H",
+    ];
+    args.extend(&shas);
+    args.extend(["--", file]);
+    Ok(parse_history(&cap(run_ok(wt, &args)?)))
 }
 
 fn parse_history(s: &str) -> Vec<(String, String)> {

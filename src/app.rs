@@ -9,7 +9,7 @@ use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
 use crate::watcher::{self, FsWatcher};
-use crate::worker::{ConflictKey, GitResult, Job};
+use crate::worker::{ConflictKey, GitResult, Job, Resolved};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -110,7 +110,9 @@ pub struct WtState {
     /// Comment to select in the diff once its commit, file and diff have loaded.
     pending_jump: Option<u64>,
     /// Working tree comment → HEAD its commit was last searched up to.
-    resolve_tried: HashMap<u64, String>,
+    resolved: HashMap<u64, String>,
+    /// HEAD and comments of the last search requested, to not repeat it while it runs.
+    resolve_sent: Option<(String, Vec<u64>)>,
     /// Working tree comments whose lines were found in no commit.
     stale: HashSet<u64>,
 }
@@ -157,7 +159,8 @@ impl WtState {
             comments_offset: 0,
             comments_reveal: false,
             pending_jump: None,
-            resolve_tried: HashMap::new(),
+            resolved: HashMap::new(),
+            resolve_sent: None,
             stale: HashSet::new(),
         }
     }
@@ -769,11 +772,19 @@ impl App {
                     return;
                 }
                 let mut moves = Vec::new();
-                for (id, sha) in res {
-                    match sha {
-                        Some(sha) => moves.push((id, sha)),
-                        None => {
+                for (id, r) in res {
+                    // A newer search for the same HEAD may have covered it already.
+                    if st.resolved.get(&id) == Some(&head) {
+                        continue;
+                    }
+                    st.resolved.insert(id, head.clone());
+                    match r {
+                        Resolved::Commit(sha) => moves.push((id, sha)),
+                        Resolved::Nowhere => {
                             st.stale.insert(id);
+                        }
+                        Resolved::Unknown => {
+                            st.stale.remove(&id);
                         }
                     }
                 }
@@ -790,6 +801,13 @@ impl App {
                             format!("Moved {n} comment{s} to the commit{s} of their lines"),
                             false,
                         );
+                        // A jump waiting for a moved comment now has to go to its commit.
+                        let pending = self.wts[i].pending_jump;
+                        if let Some(id) = pending.filter(|id| moves.iter().any(|(m, _)| m == id))
+                            && i == self.active
+                        {
+                            self.jump_to_comment(id);
+                        }
                     }
                     Err(e) => self.notify(format!("Moving comments failed: {e:#}"), true),
                 }
@@ -798,7 +816,8 @@ impl App {
     }
 
     /// Looks for the commits of working tree comments whose file has no uncommitted changes
-    /// any more, once per HEAD.
+    /// any more, once per HEAD. Each request covers every comment still unresolved, as the
+    /// worker only keeps the latest one per worktree.
     fn resolve_comments(&mut self, i: usize) {
         let st = &mut self.wts[i];
         let Some(head) = st.info.head.clone().filter(|_| st.loaded) else {
@@ -809,15 +828,17 @@ impl App {
             .comments
             .iter()
             .filter(|c| c.commit.is_none() && !st.changed(&c.file))
-            .filter(|c| st.resolve_tried.get(&c.id) != Some(&head))
+            .filter(|c| st.resolved.get(&c.id) != Some(&head))
             .cloned()
             .collect();
         if comments.is_empty() {
             return;
         }
-        for c in &comments {
-            st.resolve_tried.insert(c.id, head.clone());
+        let sent = (head.clone(), comments.iter().map(|c| c.id).collect());
+        if st.resolve_sent.as_ref() == Some(&sent) {
+            return;
         }
+        st.resolve_sent = Some(sent);
         let wt = st.info.path.clone();
         self.send(Job::ResolveComments { wt, head, comments });
     }
@@ -1566,11 +1587,28 @@ impl App {
         } else {
             c.body = body.to_string();
             c.updated = comments::now().0;
-            let res = st.comments.upsert(c).map(|()| "Comment saved");
-            if res.is_ok() {
-                st.select_comment(Some(id));
+            let res = if input.existing {
+                // Only what the input changed: the comment may have been moved to a commit
+                // (or edited by another instance) meanwhile.
+                st.comments.edit(id, |s| {
+                    s.body = c.body;
+                    s.updated = c.updated;
+                    if s.commit == c.commit {
+                        (s.side, s.line, s.line_text, s.start) =
+                            (c.side, c.line, c.line_text, c.start);
+                    }
+                })
+            } else {
+                st.comments.upsert(c).map(|()| true)
+            };
+            match res {
+                Ok(true) => {
+                    st.select_comment(Some(id));
+                    Ok("Comment saved")
+                }
+                Ok(false) => Err(anyhow::anyhow!("it was deleted elsewhere")),
+                Err(e) => Err(e),
             }
-            res
         };
         st.reanchor();
         match res {

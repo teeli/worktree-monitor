@@ -1,6 +1,6 @@
 //! Line comments, stored as JSON per worktree under the XDG state directory.
 
-use crate::diff::{Diff, LineKind};
+use crate::diff::{Diff, DiffLine, LineKind};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: u32 = 1;
+/// Furthest a committed line may be from where a working tree comment was written.
+const MAX_DRIFT: u32 = 100;
 /// JSON schema of the comment files; written next to them and referenced by `$schema`.
 const SCHEMA: &str = include_str!("../schema/comments.schema.json");
 const SCHEMA_FILE: &str = "comments.schema.json";
@@ -191,6 +193,19 @@ impl Store {
         self.modify(|all| all.retain(|c| c.id != id))
     }
 
+    /// Applies `f` to the stored comment `id`, leaving all others as they are on disk.
+    /// Returns whether the comment still exists.
+    pub fn edit(&mut self, id: u64, f: impl FnOnce(&mut Comment)) -> Result<bool> {
+        let mut found = false;
+        self.modify(|all| {
+            if let Some(c) = all.iter_mut().find(|c| c.id == id) {
+                f(c);
+                found = true;
+            }
+        })?;
+        Ok(found)
+    }
+
     /// Moves working tree comments to the commits their lines were committed in.
     pub fn move_to_commits(&mut self, moves: &[(u64, String)]) -> Result<()> {
         self.modify(|all| {
@@ -203,27 +218,35 @@ impl Store {
     }
 }
 
-/// The commit (oldest first in `history`) a working tree comment's line was most likely
-/// committed in: the first one changing a line with its text on its side, else the first one
-/// showing such a line at all (comments on context lines).
+/// The commit in `history` (oldest first) a working tree comment's line was most likely
+/// committed in: one adding (or, on the old side, removing) a line with its text within
+/// `MAX_DRIFT` lines of where it was, the nearest such line winning, then the oldest commit.
+/// A range comment's first line must appear in that commit's diff too. Comments on unchanged
+/// lines can't be told apart from any other commit touching the file, so they find nothing.
 pub fn resolve_commit<'a>(c: &Comment, history: &'a [(String, Diff)]) -> Option<&'a str> {
     let changed = match c.side {
         Side::New => LineKind::Add,
         Side::Old => LineKind::Del,
     };
-    let has = |diff: &Diff, kinds: &[LineKind]| {
-        (0..diff.lines.len()).any(|i| {
-            let l = &diff.lines[i];
-            kinds.contains(&l.kind) && l.text == c.line_text && line_no(diff, i, c.side).is_some()
+    let matches = |l: &DiffLine| l.kind == changed && l.text == c.line_text;
+    let has_start = |d: &Diff| {
+        c.start
+            .as_ref()
+            .is_none_or(|s| d.lines.iter().any(|l| l.text == s.text))
+    };
+    history
+        .iter()
+        .enumerate()
+        .filter_map(|(k, (sha, d))| {
+            let dist = (0..d.lines.len())
+                .filter(|&i| matches(&d.lines[i]))
+                .filter_map(|i| line_no(d, i, c.side))
+                .map(|n| n.abs_diff(c.line))
+                .min()?;
+            (dist <= MAX_DRIFT && has_start(d)).then_some((dist, k, sha.as_str()))
         })
-    };
-    let pick = |kinds: &[LineKind]| {
-        history
-            .iter()
-            .find(|(_, d)| has(d, kinds))
-            .map(|(sha, _)| sha.as_str())
-    };
-    pick(&[changed]).or_else(|| pick(&[changed, LineKind::Context]))
+        .min_by_key(|&(dist, k, _)| (dist, k))
+        .map(|(_, _, sha)| sha)
 }
 
 /// Where the comments of one diff are shown.
@@ -449,6 +472,11 @@ mod tests {
         // Only working tree comments move.
         s.move_to_commits(&[(2, "def".into())]).unwrap();
         assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
+        // Edits touch only the given comment, and only what `f` changes.
+        assert!(s.edit(2, |c| c.body = "patched".into()).unwrap());
+        let stored = &Store::load_from(wt, Some(path.clone())).comments[0];
+        assert_eq!((stored.body.as_str(), stored.line), ("patched", 4));
+        assert!(!s.edit(99, |_| unreachable!()).unwrap());
 
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, Some(path.clone()));
@@ -484,27 +512,33 @@ mod tests {
             h("a", "@@ -1,2 +1,2 @@\n x\n-y\n+z\n"),
             h("b", "@@ -1,2 +1,3 @@\n x\n z\n+w\n"),
         ];
+        let r = |c: Comment| resolve_commit(&c, &history).map(String::from);
+        assert_eq!(r(comment(1, Side::New, 2, "z", None)).as_deref(), Some("a"));
+        assert_eq!(r(comment(2, Side::Old, 2, "y", None)).as_deref(), Some("a"));
+        assert_eq!(r(comment(3, Side::New, 3, "w", None)).as_deref(), Some("b"));
+        // Unchanged lines are ambiguous.
+        assert_eq!(r(comment(4, Side::New, 1, "x", None)), None);
+        assert_eq!(r(comment(5, Side::New, 1, "gone", None)), None);
+
+        // A common line: the nearest match wins, far-away ones don't count.
+        let history = vec![
+            h("far", "@@ -500,1 +500,2 @@\n a\n+}\n"),
+            h("near", "@@ -10,1 +10,2 @@\n a\n+}\n"),
+        ];
+        let r = |c: Comment| resolve_commit(&c, &history).map(String::from);
         assert_eq!(
-            resolve_commit(&comment(1, Side::New, 2, "z", None), &history),
-            Some("a")
+            r(comment(6, Side::New, 12, "}", None)).as_deref(),
+            Some("near")
         );
-        assert_eq!(
-            resolve_commit(&comment(2, Side::Old, 2, "y", None), &history),
-            Some("a")
-        );
-        assert_eq!(
-            resolve_commit(&comment(3, Side::New, 3, "w", None), &history),
-            Some("b")
-        );
-        // Only ever context: the first commit showing it.
-        assert_eq!(
-            resolve_commit(&comment(4, Side::New, 1, "x", None), &history),
-            Some("a")
-        );
-        assert_eq!(
-            resolve_commit(&comment(5, Side::New, 1, "gone", None), &history),
-            None
-        );
+        assert_eq!(r(comment(7, Side::New, 300, "}", None)), None);
+        // A range's first line must be in the same commit.
+        let mut range = comment(8, Side::New, 11, "}", None);
+        range.start = Some(LinePos {
+            side: Side::New,
+            line: 9,
+            text: "missing".into(),
+        });
+        assert_eq!(r(range), None);
     }
 
     #[test]

@@ -20,7 +20,8 @@ commit history, side by side and updating in near-realtime.
 - **Comments pane** (`C`) on the right lists every comment of the worktree, working tree and commits alike.
   `Ctrl-n` / `Ctrl-p` (or a click on an entry) jump to a comment, switching to its commit, file and line.
   Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found
-  in any commit since (e.g. the changes were discarded), it is marked *stale*.
+  in any commit since (e.g. the changes were discarded), it is marked *stale*. Comments on unchanged lines can't be
+  traced to a commit and become stale as well.
 - **Copy the file path to the clipboard,** with `:line` (or `:start-end`) appended when diff lines are selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
   when file watching is unavailable). Adding or removing worktrees updates

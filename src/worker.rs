@@ -109,9 +109,18 @@ pub enum GitResult {
     ResolveComments {
         wt: PathBuf,
         head: String,
-        /// Comment id → its commit, `None` when none was found.
-        res: Vec<(u64, Option<String>)>,
+        res: Vec<(u64, Resolved)>,
     },
+}
+
+/// Where a committed working tree comment's lines went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    Commit(String),
+    /// In no commit since the comment was written: the changes were discarded.
+    Nowhere,
+    /// The history could not be read (e.g. the comment's HEAD no longer exists).
+    Unknown,
 }
 
 pub fn spawn(repo_dir: PathBuf, events: Sender<AppEvent>) -> Sender<Job> {
@@ -198,25 +207,33 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
     }
 }
 
-fn resolve_comments(wt: &std::path::Path, comments: &[Comment]) -> Vec<(u64, Option<String>)> {
-    // One history per (HEAD when written, file); a failure (e.g. unknown commit) finds nothing.
+fn resolve_comments(wt: &std::path::Path, comments: &[Comment]) -> Vec<(u64, Resolved)> {
+    // One history per (HEAD when written, file); `None` when it can't be read.
     let mut histories = std::collections::HashMap::new();
     comments
         .iter()
         .map(|c| {
-            let sha = c.head.as_ref().and_then(|head| {
-                let history = histories
-                    .entry((head.clone(), c.file.clone()))
-                    .or_insert_with(|| {
-                        git::file_history(wt, head, &c.file)
-                            .unwrap_or_default()
-                            .into_iter()
+            let Some(head) = &c.head else {
+                return (c.id, Resolved::Unknown);
+            };
+            let history = histories
+                .entry((head.clone(), c.file.clone()))
+                .or_insert_with(|| {
+                    let h = git::file_history(wt, head, &c.file).ok()?;
+                    Some(
+                        h.into_iter()
                             .map(|(sha, raw)| (sha, diff::parse(&raw)))
-                            .collect::<Vec<_>>()
-                    });
-                comments::resolve_commit(c, history).map(String::from)
-            });
-            (c.id, sha)
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            let res = match history {
+                None => Resolved::Unknown,
+                Some(h) => match comments::resolve_commit(c, h) {
+                    Some(sha) => Resolved::Commit(sha.to_string()),
+                    None => Resolved::Nowhere,
+                },
+            };
+            (c.id, res)
         })
         .collect()
 }

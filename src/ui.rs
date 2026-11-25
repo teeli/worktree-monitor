@@ -735,6 +735,10 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
         max -= 1;
         total += heights[max];
     }
+    // The entry that overflowed doesn't fit; start after it unless it is the last one.
+    if total > h && max + 1 < len {
+        max += 1;
+    }
     let mut off = st.comments_offset.min(max);
     let sel = st
         .comment_sel
