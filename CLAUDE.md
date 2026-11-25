@@ -15,5 +15,9 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 - **Always keep the README screenshot up to date.** After any change to the code, regenerate it with
   `uv run scripts/screenshot.py` and commit the updated `docs/screenshot.png` together with the change. If the
   change adds UI worth showing, adjust the demo repo or key sequence in `scripts/screenshot.py` so it appears.
+- **Check colors against the Dracula spec.** When a UI change adds or changes colors, verify the Dracula theme
+  (`Theme::dracula` in `src/theme.rs`) against https://draculatheme.com/spec: use exact palette values only (no
+  custom hex) and follow its usage rules (e.g. Comment token for comments, Selection for selections, Red for
+  deletions).
 - Keep the README's key table in sync with `src/keymap.rs` (`BINDINGS` is the single source of truth for the
   `?` help popup).

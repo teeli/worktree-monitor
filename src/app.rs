@@ -1,8 +1,10 @@
 //! Application state, event handling and actions.
 
 use crate::clipboard::Clipboard;
-use crate::diff::{self, Diff};
+use crate::comments::{self, Anchors, Comment, LinePos, Side, Store};
+use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
+use crate::input::{LineInput, Outcome};
 use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
@@ -10,10 +12,13 @@ use crate::watcher::{self, FsWatcher};
 use crate::worker::{ConflictKey, GitResult, Job};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -89,12 +94,19 @@ pub struct WtState {
     pub diff_offset: usize,
     pub diff_hscroll: usize,
     pub diff_sel: Option<usize>,
+    /// Other end of a Shift-extended line selection.
+    pub diff_anchor: Option<usize>,
+
+    pub comments: Store,
+    /// Where the comments for the shown diff sit.
+    pub anchors: Anchors,
 }
 
 impl WtState {
     fn new(info: Worktree) -> Self {
         let canon = std::fs::canonicalize(&info.path).unwrap_or_else(|_| info.path.clone());
         let gitdir = resolve_gitdir(&info.path);
+        let comments = Store::load(&canon);
         WtState {
             info,
             canon,
@@ -125,6 +137,9 @@ impl WtState {
             diff_offset: 0,
             diff_hscroll: 0,
             diff_sel: None,
+            diff_anchor: None,
+            comments,
+            anchors: Anchors::default(),
         }
     }
 
@@ -174,7 +189,56 @@ impl WtState {
         self.diff_offset = 0;
         self.diff_hscroll = 0;
         self.diff_sel = None;
+        self.diff_anchor = None;
+        self.anchors = Anchors::default();
     }
+
+    fn reanchor(&mut self) {
+        self.anchors = match &self.file {
+            Some(f) => comments::anchor(
+                &self.comments.comments,
+                &self.diff,
+                &f.path,
+                self.commit.as_ref().map(|c| c.sha.as_str()),
+            ),
+            None => Anchors::default(),
+        };
+    }
+
+    /// Selected diff lines, from the selection anchor (if any) to the cursor.
+    pub fn sel_range(&self) -> Option<RangeInclusive<usize>> {
+        let sel = self.diff_sel?;
+        let anchor = self.diff_anchor.unwrap_or(sel);
+        Some(anchor.min(sel)..=anchor.max(sel))
+    }
+
+    /// Side and line number of diff line `i`, if it can be commented on.
+    fn line_pos(&self, i: usize) -> Option<LinePos> {
+        let line = self.diff.lines.get(i)?;
+        let side = if line.kind == LineKind::Del {
+            Side::Old
+        } else {
+            Side::New
+        };
+        Some(LinePos {
+            side,
+            line: comments::line_no(&self.diff, i, side)?,
+            text: line.text.clone(),
+        })
+    }
+}
+
+/// A comment being written or edited below its diff line. While it is open, the worktree's
+/// file selection and diff are not refreshed, so the line it belongs to stays put.
+pub struct CommentInput {
+    pub edit: LineInput,
+    /// Worktree the comment belongs to.
+    wt: PathBuf,
+    /// Diff line the input is shown below.
+    pub at: usize,
+    /// The comment to save; its body is replaced with the edited text.
+    pub comment: Comment,
+    existing: bool,
 }
 
 /// Canonical git directory of a worktree; empty when it cannot be read (yet).
@@ -205,6 +269,7 @@ pub struct App {
     pub toast: Option<(String, bool, Instant)>,
     pub hit: HitAreas,
     pub pending_keys: Option<String>,
+    pub input: Option<CommentInput>,
     quit: bool,
     jobs: Sender<Job>,
     events: Sender<AppEvent>,
@@ -243,6 +308,7 @@ impl App {
             toast: None,
             hit: HitAreas::default(),
             pending_keys: None,
+            input: None,
             quit: false,
             jobs,
             events,
@@ -254,6 +320,9 @@ impl App {
             next_id: 1,
             clipboard: Clipboard::default(),
         };
+        if let Some(e) = app.wts.iter().find_map(|w| w.comments.error.clone()) {
+            app.notify(format!("Comments unreadable: {e}"), true);
+        }
         app.rewatch();
         app.refresh_all();
         Ok(app)
@@ -386,7 +455,12 @@ impl App {
                 self.dirty = true;
                 match ev {
                     Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-                    Event::Mouse(m) => self.on_mouse(m),
+                    Event::Mouse(m) if self.input.is_none() => self.on_mouse(m),
+                    Event::Paste(text) => {
+                        if let Some(input) = &mut self.input {
+                            input.edit.paste(&text);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -477,6 +551,7 @@ impl App {
             GitResult::Worktrees { res: Err(e), .. } => self.notify(format!("{e:#}"), true),
             GitResult::Status { wt, res } => {
                 let active = self.active;
+                let editing = self.editing(&wt);
                 let Some(i) = self.index_of(&wt) else { return };
                 let st = &mut self.wts[i];
                 match res {
@@ -484,7 +559,8 @@ impl App {
                         st.error = None;
                         st.loaded = true;
                         st.changes = changes;
-                        if st.commit.is_none() {
+                        // Rows and diff catch up once the comment input closes.
+                        if st.commit.is_none() && !editing {
                             let kept = st.rebuild_rows();
                             self.sync_selection(i, kept);
                             if i == active {
@@ -563,9 +639,10 @@ impl App {
                 }
             }
             GitResult::Diff { wt, id, res } => {
+                let editing = self.editing(&wt);
                 let Some(i) = self.index_of(&wt) else { return };
                 let st = &mut self.wts[i];
-                if st.diff_id != id {
+                if st.diff_id != id || editing {
                     return;
                 }
                 match res {
@@ -576,12 +653,41 @@ impl App {
                             st.diff_raw = Some(raw);
                             let last = st.diff.lines.len().saturating_sub(1);
                             st.diff_sel = st.diff_sel.map(|s| s.min(last));
+                            st.diff_anchor = st.diff_anchor.map(|s| s.min(last));
                             st.diff_offset = st.diff_offset.min(last);
+                            st.reanchor();
                         }
                     }
                     Err(e) => st.diff_error = Some(format!("{e:#}")),
                 }
             }
+        }
+    }
+
+    /// Whether a comment input is open for worktree `wt`.
+    fn editing(&self, wt: &Path) -> bool {
+        self.input.as_ref().is_some_and(|i| i.wt == wt)
+    }
+
+    /// Closes the comment input, saving it when `save`, and catches up on refreshes it held back.
+    fn close_input(&mut self, save: bool) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let Some(i) = self.index_of(&input.wt) else {
+            self.notify("Worktree is gone; comment not saved".into(), true);
+            return;
+        };
+        if save {
+            self.save_comment(i, input);
+        }
+        let st = &mut self.wts[i];
+        if st.commit.is_none() {
+            let kept = st.rebuild_rows();
+            self.sync_selection(i, kept);
+        }
+        if i == self.active {
+            self.request_diff(i);
         }
     }
 
@@ -738,7 +844,15 @@ impl App {
 
     // ---- input ------------------------------------------------------------------
 
-    fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+    fn on_key(&mut self, key: KeyEvent) {
+        if let Some(input) = &mut self.input {
+            match input.edit.on_key(&key) {
+                Outcome::Edited => {}
+                Outcome::Cancel => self.close_input(false),
+                Outcome::Submit => self.close_input(true),
+            }
+            return;
+        }
         let Some(name) = keymap::key_name(&key) else {
             return;
         };
@@ -789,14 +903,16 @@ impl App {
                 self.refresh_all();
                 self.notify("Refreshing…".into(), false);
             }
-            Action::Down => self.move_by(1, true),
-            Action::Up => self.move_by(-1, true),
-            Action::HalfDown => self.move_by(self.page(2), false),
-            Action::HalfUp => self.move_by(-self.page(2), false),
-            Action::PageDown => self.move_by(self.page(1), false),
-            Action::PageUp => self.move_by(-self.page(1), false),
-            Action::Top => self.move_by(isize::MIN / 2, false),
-            Action::Bottom => self.move_by(isize::MAX / 2, false),
+            Action::Down => self.move_by(1, true, false),
+            Action::Up => self.move_by(-1, true, false),
+            Action::ExtendDown => self.move_by(1, true, true),
+            Action::ExtendUp => self.move_by(-1, true, true),
+            Action::HalfDown => self.move_by(self.page(2), false, false),
+            Action::HalfUp => self.move_by(-self.page(2), false, false),
+            Action::PageDown => self.move_by(self.page(1), false, false),
+            Action::PageUp => self.move_by(-self.page(1), false, false),
+            Action::Top => self.move_by(isize::MIN / 2, false, false),
+            Action::Bottom => self.move_by(isize::MAX / 2, false, false),
             Action::Left | Action::Right => self.left_right(action == Action::Right),
             Action::Toggle => self.toggle(),
             Action::CollapseRecursive | Action::ExpandRecursive => {
@@ -812,9 +928,11 @@ impl App {
                 let msg = if self.wrap { "Wrap on" } else { "Wrap off" };
                 self.notify(msg.into(), false);
             }
+            Action::Comment => self.start_comment(),
             Action::Escape => {
                 if let Some(st) = self.wts.get_mut(self.active) {
                     st.diff_sel = None;
+                    st.diff_anchor = None;
                 }
             }
             Action::PrevWorktree | Action::NextWorktree => {}
@@ -835,11 +953,17 @@ impl App {
     }
 
     /// Moves the diff cursor. Single steps start/move the line selection; larger jumps
-    /// scroll and carry an existing selection along.
-    fn move_by(&mut self, delta: isize, single: bool) {
+    /// scroll and carry an existing selection along. `extend` keeps the other end of the
+    /// selection where it is (Shift-selection); any other move collapses it.
+    fn move_by(&mut self, delta: isize, single: bool, extend: bool) {
         let height = self.pane_height(Pane::Diff);
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
+        };
+        st.diff_anchor = if extend {
+            st.diff_anchor.or(st.diff_sel)
+        } else {
+            None
         };
         let len = st.diff.lines.len();
         match st.diff_sel {
@@ -850,14 +974,8 @@ impl App {
                     len,
                 ))
             }
-            None => {
-                let max = if self.wrap {
-                    len
-                } else {
-                    len.saturating_sub(height - 1)
-                };
-                st.diff_offset = offset(st.diff_offset, delta, max)
-            }
+            // Rendering clamps the offset, as only it knows how many rows comments take.
+            None => st.diff_offset = offset(st.diff_offset, delta, len),
             Some(s) => st.diff_sel = Some(offset(s, delta, len)),
         }
         if let Some(s) = st.diff_sel {
@@ -1038,6 +1156,7 @@ impl App {
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
+        st.diff_anchor = None;
         let cur = st.diff_sel.unwrap_or(st.diff_offset);
         let hunks: Vec<usize> = st.diff.hunk_starts().collect();
         let target = if forward {
@@ -1073,15 +1192,102 @@ impl App {
         } else {
             file.path.clone()
         };
-        if let Some(line) = st
-            .diff_sel
-            .and_then(|i| st.diff.line_for_copy(i, st.commit.is_some()))
-        {
-            text = format!("{text}:{line}");
+        let line = |i: usize| st.diff.line_for_copy(i, st.commit.is_some());
+        let lines: Vec<u32> = st
+            .sel_range()
+            .map(|r| {
+                [*r.start(), *r.end()]
+                    .into_iter()
+                    .filter_map(line)
+                    .collect()
+            })
+            .unwrap_or_default();
+        match (lines.iter().min(), lines.iter().max()) {
+            (Some(a), Some(b)) if a != b => text = format!("{text}:{a}-{b}"),
+            (Some(a), _) => text = format!("{text}:{a}"),
+            _ => {}
         }
         match self.clipboard.copy(&text) {
             Ok(()) => self.notify(format!("Copied {text}"), false),
             Err(e) => self.notify(format!("Copy failed: {e}"), true),
+        }
+    }
+
+    /// Opens the comment input below the selected line (the last one of a range), with the
+    /// comment shown there if there is one.
+    fn start_comment(&mut self) {
+        let Some(st) = self.active() else { return };
+        // The first and last commentable lines of the selection.
+        let range = st.sel_range();
+        let first = range
+            .clone()
+            .and_then(|r| r.into_iter().find_map(|i| Some((i, st.line_pos(i)?))));
+        let last = range.and_then(|r| r.rev().find_map(|i| Some((i, st.line_pos(i)?))));
+        let (Some(file), Some((first, start)), Some((at, end))) = (&st.file, first, last) else {
+            self.notify("Select a diff line to comment".into(), true);
+            return;
+        };
+        let start = (first != at).then_some(start);
+        let shown = st.anchors.by_line.get(&at);
+        let (comment, existing) = match shown.and_then(|a| st.comments.comments.get(a.comment)) {
+            // Re-anchored comments move to where they are shown now; a newly selected range
+            // replaces theirs.
+            Some(c) => (
+                Comment {
+                    side: end.side,
+                    line: end.line,
+                    line_text: end.text,
+                    start: start.or_else(|| c.start.clone()),
+                    ..c.clone()
+                },
+                true,
+            ),
+            None => {
+                let (secs, nanos) = comments::now();
+                let comment = Comment {
+                    id: nanos,
+                    file: file.path.clone(),
+                    side: end.side,
+                    line: end.line,
+                    line_text: end.text,
+                    start,
+                    commit: st.commit.as_ref().map(|c| c.sha.clone()),
+                    head: st.info.head.clone(),
+                    body: String::new(),
+                    created: secs,
+                    updated: secs,
+                };
+                (comment, false)
+            }
+        };
+        self.input = Some(CommentInput {
+            edit: LineInput::new(&comment.body),
+            wt: st.info.path.clone(),
+            at,
+            comment,
+            existing,
+        });
+    }
+
+    /// Saves the edited comment; empty text deletes it.
+    fn save_comment(&mut self, i: usize, input: CommentInput) {
+        let st = &mut self.wts[i];
+        let body = input.edit.text.trim();
+        let mut c = input.comment;
+        let res = if body.is_empty() {
+            if !input.existing {
+                return;
+            }
+            st.comments.remove(c.id).map(|()| "Comment deleted")
+        } else {
+            c.body = body.to_string();
+            c.updated = comments::now().0;
+            st.comments.upsert(c).map(|()| "Comment saved")
+        };
+        st.reanchor();
+        match res {
+            Ok(msg) => self.notify(msg.into(), false),
+            Err(e) => self.notify(format!("Saving comment failed: {e:#}"), true),
         }
     }
 
@@ -1123,18 +1329,10 @@ impl App {
                         }
                     }
                     Pane::Diff => {
-                        let line = if self.wrap {
-                            crate::ui::line_at_row(
-                                &st.diff,
-                                st.diff_offset,
-                                rel,
-                                self.hit.diff.width,
-                            )
-                        } else {
-                            st.diff_offset + rel
-                        };
+                        let line = crate::ui::line_at_row(st, self.wrap, rel, self.hit.diff.width);
                         if line < st.diff.lines.len() {
                             st.diff_sel = Some(line);
+                            st.diff_anchor = None;
                         }
                     }
                     Pane::Commits => {
@@ -1171,13 +1369,9 @@ impl App {
                         st.tree_offset =
                             offset(st.tree_offset, delta, st.rows.len().saturating_sub(h) + 1)
                     }
+                    // Rendering clamps the offset, as only it knows how many rows comments take.
                     Pane::Diff => {
-                        let max = if self.wrap {
-                            st.diff.lines.len()
-                        } else {
-                            st.diff.lines.len().saturating_sub(h) + 1
-                        };
-                        st.diff_offset = offset(st.diff_offset, delta, max)
+                        st.diff_offset = offset(st.diff_offset, delta, st.diff.lines.len())
                     }
                     Pane::Commits => {
                         st.commit_offset = offset(

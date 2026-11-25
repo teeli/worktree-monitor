@@ -1,7 +1,9 @@
 mod app;
 mod clipboard;
+mod comments;
 mod diff;
 mod git;
+mod input;
 mod keymap;
 mod theme;
 mod tree;
@@ -12,7 +14,9 @@ mod worker;
 use anyhow::Result;
 use app::{App, AppEvent};
 use clap::Parser;
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::execute;
 use std::sync::mpsc;
 use std::thread;
@@ -37,10 +41,14 @@ fn main() -> Result<()> {
     watcher::spawn_ticker(tx.clone());
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         prev_hook(info);
     }));
 
@@ -53,7 +61,11 @@ fn main() -> Result<()> {
     });
 
     let res = app::run(&mut terminal, app, rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     res
 }

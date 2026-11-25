@@ -12,7 +12,12 @@ commit history, side by side and updating in near-realtime.
 - **Changed files as a tree:** modified, added, deleted, renamed, untracked and conflicted. Directories are collapsible.
 - **Diff view** with old/new line numbers, hunk navigation that continues into adjacent files, line selection, and optional soft wrap (`w`).
 - **Commit list.** Select a commit to browse its files and diffs. Select *Working tree* to go back.
-- **Copy the file path to the clipboard,** with `:line` appended when a diff line is selected. Uses OSC 52 over SSH.
+- **Line comments.** Press `c` on a selected diff line (or a range selected with `Shift-↓`/`Shift-↑`) to write a
+  note right below it. Comments are tied to the file, lines and viewed commit, follow their lines when the file
+  changes, and are marked by a bar in the gutter. They are stored as JSON per worktree in `$XDG_STATE_HOME/wtm`
+  (default `~/.local/state/wtm`); the format is described by [`schema/comments.schema.json`](schema/comments.schema.json),
+  a copy of which is written next to the files and linked from their `$schema`.
+- **Copy the file path to the clipboard,** with `:line` (or `:start-end`) appended when diff lines are selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
   when file watching is unavailable). Adding or removing worktrees updates
   the tabs.
@@ -51,8 +56,10 @@ Press `?` in the app for the full list.
 | | `N` / `P` | Next (older) / previous (newer) commit |
 | Diff | `j` `k` (also `}` `{`) | Next / previous hunk, continuing into adjacent files |
 | | `↓` `↑` | Move the line selection |
+| | `Shift-↓` `Shift-↑` | Extend the line selection to a range |
 | | `h` `l` / `←` `→` | Scroll horizontally |
 | | `w` | Toggle soft wrap (off by default) |
+| | `c` | Comment on the selected line (edit if it has one; save empty to delete) |
 | | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Half page / page / top / bottom |
 | | `Esc` | Clear line selection |
 | File tree | `Enter` / `Space` | Toggle directory (of the current file) |

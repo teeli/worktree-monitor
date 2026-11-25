@@ -243,8 +243,11 @@ def main():
         keys = [
             ("n" * 4, 0.6),  # step through files to src/server.rs
             ("j", 0.3),  # jump to the hunk
-            (down * 6, 0.3),  # select the `tokens: TokenStore` line
-            ("y", 0.5),  # copy path:line (shows toast)
+            (down * 12, 0.3),  # select the `let tokens = …` line
+            ("\x1b[1;2B", 0.3),  # Shift-↓: extend the selection to `Server { config, tokens }`
+            ("c", 0.3),  # comment on the range
+            ("Share one TokenStore with the routes instead of building it here", 0.3),
+            ("\r", 0.5),  # save (shows toast)
         ]
         screen = capture(binary, repo, base, keys)
     OUT.parent.mkdir(exist_ok=True)

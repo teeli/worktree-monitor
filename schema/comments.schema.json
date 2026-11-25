@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/teeli/worktree-monitor/main/schema/comments.schema.json",
+  "title": "wtm comments",
+  "description": "Line comments of one git worktree, written by worktree-monitor (wtm).",
+  "type": "object",
+  "required": ["version", "worktree", "comments"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "description": "URL of this schema.",
+      "type": "string"
+    },
+    "version": {
+      "description": "File format version.",
+      "const": 1
+    },
+    "worktree": {
+      "description": "Canonical path of the worktree.",
+      "type": "string"
+    },
+    "comments": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/comment" }
+    }
+  },
+  "$defs": {
+    "side": {
+      "description": "Diff side a line number refers to: deleted lines only exist in the old file.",
+      "enum": ["old", "new"]
+    },
+    "sha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "unixTime": {
+      "description": "Unix time in seconds.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "linePos": {
+      "type": "object",
+      "required": ["side", "line", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "side": { "$ref": "#/$defs/side" },
+        "line": { "type": "integer", "minimum": 0 },
+        "text": { "description": "The line's text when the comment was written.", "type": "string" }
+      }
+    },
+    "comment": {
+      "type": "object",
+      "required": ["id", "file", "side", "line", "line_text", "commit", "head", "body", "created", "updated"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Unique within the worktree (creation time in nanoseconds).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "file": { "description": "Repository-relative path of the commented file.", "type": "string" },
+        "side": { "$ref": "#/$defs/side" },
+        "line": {
+          "description": "Line number on `side`; the last line of a range, below which the comment is shown.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "line_text": {
+          "description": "Text of `line` when the comment was written; used to follow the line when the file changes.",
+          "type": "string"
+        },
+        "start": {
+          "description": "First line of a comment on a range of lines.",
+          "$ref": "#/$defs/linePos"
+        },
+        "commit": {
+          "description": "Commit the line was viewed in; null for the working tree.",
+          "$ref": "#/$defs/sha"
+        },
+        "head": {
+          "description": "Worktree HEAD when the comment was written.",
+          "$ref": "#/$defs/sha"
+        },
+        "body": { "type": "string", "minLength": 1 },
+        "created": { "$ref": "#/$defs/unixTime" },
+        "updated": { "$ref": "#/$defs/unixTime" }
+      }
+    }
+  }
+}
