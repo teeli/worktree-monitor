@@ -41,8 +41,9 @@ enum Command {
         /// Delete the listed files instead of only listing them.
         #[arg(long, short)]
         yes: bool,
-        /// Also include files whose repository no longer exists on disk. Careful: a repository
-        /// on a volume that isn't mounted looks deleted too.
+        /// Also include files whose repository no longer exists on disk, or wasn't recorded
+        /// (files from older versions). Careful: a repository on a volume that isn't mounted
+        /// looks deleted too.
         #[arg(long)]
         deleted_repos: bool,
     },
@@ -106,6 +107,7 @@ fn prune(yes: bool, deleted_repos: bool) -> Result<()> {
             let why = match o.gone {
                 Gone::Worktree => "worktree removed",
                 Gone::Repo => "repository missing",
+                Gone::Unknown => "repository unknown",
             };
             println!(
                 "  {:>3} comment{s:<1}  {}  ({why})",
@@ -118,7 +120,7 @@ fn prune(yes: bool, deleted_repos: bool) -> Result<()> {
         let n = kept.len();
         let s = if n == 1 { "" } else { "s" };
         println!(
-            "{n} file{s} of missing repositories skipped; add --deleted-repos to include them"
+            "{n} file{s} of missing or unknown repositories skipped; add --deleted-repos to include them"
         );
     }
     if picked.is_empty() {

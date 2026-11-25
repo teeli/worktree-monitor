@@ -75,7 +75,9 @@ wtm prune --yes              # delete them
 wtm prune --deleted-repos    # also include repositories that no longer exist
 ```
 
-`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume.
+Worktrees git still lists are kept even when their directory is missing, e.g. on an unmounted volume.
+`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume, and also
+includes files from older versions of `wtm` that didn't record their repository.
 
 ## Keys
 
