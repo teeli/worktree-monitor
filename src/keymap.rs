@@ -63,6 +63,7 @@ pub enum Action {
     NextComment,
     PrevComment,
     CloseComment,
+    Reply,
     ToggleClosed,
     Escape,
 }
@@ -222,7 +223,7 @@ pub const BINDINGS: &[Binding] = &[
         &["c"],
         A::Comment,
         "c",
-        "Comment on selected line (edit/delete if commented)",
+        "Comment on selected line (edit/delete it, or its highlighted reply)",
     ),
     b(
         Comments,
@@ -236,14 +237,14 @@ pub const BINDINGS: &[Binding] = &[
         &["C-n"],
         A::NextComment,
         "Ctrl-n",
-        "Jump to next comment",
+        "Jump to next comment or reply",
     ),
     b(
         Comments,
         &["C-p"],
         A::PrevComment,
         "Ctrl-p",
-        "Jump to previous comment",
+        "Jump to previous comment or reply",
     ),
     b(
         Comments,
@@ -251,6 +252,13 @@ pub const BINDINGS: &[Binding] = &[
         A::CloseComment,
         "x",
         "Close / reopen comment (selected line, else pane highlight)",
+    ),
+    b(
+        Comments,
+        &["R"],
+        A::Reply,
+        "R",
+        "Reply to comment (selected line, else pane highlight)",
     ),
     b(
         Comments,

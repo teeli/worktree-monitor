@@ -1,7 +1,7 @@
 //! Application state, event handling and actions.
 
 use crate::clipboard::Clipboard;
-use crate::comments::{self, Anchors, Closed, Comment, LinePos, Side, Store};
+use crate::comments::{self, Anchors, Closed, Comment, LinePos, Reply, Side, Store};
 use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::input::{LineInput, Outcome};
@@ -103,6 +103,8 @@ pub struct WtState {
     pub anchors: Anchors,
     /// Comment highlighted in the comments pane; comment navigation continues from it.
     pub comment_sel: Option<u64>,
+    /// Reply of `comment_sel` highlighted; `None` for the comment itself.
+    pub reply_sel: Option<u64>,
     /// First comment pane entry shown.
     pub comments_offset: usize,
     /// Scroll the comments pane to `comment_sel` on the next render.
@@ -156,6 +158,7 @@ impl WtState {
             comments,
             anchors: Anchors::default(),
             comment_sel: None,
+            reply_sel: None,
             comments_offset: 0,
             comments_reveal: false,
             pending_jump: None,
@@ -250,20 +253,134 @@ impl WtState {
     /// Clears the pane highlight if its comment is no longer listed (deleted, or closed and
     /// hidden), so `x` and comment navigation don't act on an invisible comment.
     fn drop_hidden_sel(&mut self, show_closed: bool) {
-        let Some(id) = self.comment_sel else { return };
+        let Some(id) = self.comment_sel else {
+            self.reply_sel = None;
+            return;
+        };
         let all = &self.comments.comments;
-        if !self
+        let shown = self
             .comment_order(show_closed)
-            .iter()
-            .any(|&ci| all[ci].id == id)
-        {
-            self.comment_sel = None;
+            .into_iter()
+            .find(|&ci| all[ci].id == id);
+        match shown {
+            None => (self.comment_sel, self.reply_sel) = (None, None),
+            Some(ci) => {
+                let replies = &all[ci].replies;
+                if self
+                    .reply_sel
+                    .is_some_and(|r| !replies.iter().any(|x| x.id == r))
+                {
+                    self.reply_sel = None;
+                }
+            }
         }
     }
 
+    /// Highlights comment `id` itself; keeps the reply highlight if it is the same comment.
     fn select_comment(&mut self, id: Option<u64>) {
+        if self.comment_sel != id {
+            self.reply_sel = None;
+        }
         self.comment_sel = id;
         self.comments_reveal = true;
+    }
+
+    /// The comment (index into `comments.comments`) on the selected diff line, shown below it
+    /// or one whose range covers it, else the one highlighted in the pane if it is listed.
+    fn target_comment(&self, show_closed: bool) -> Option<usize> {
+        let all = &self.comments.comments;
+        let on_line = self
+            .diff_sel
+            .and_then(|s| {
+                let below = self.anchors.by_line.get(&s).map(|a| a.comment);
+                below.or_else(|| self.anchors.covering(s))
+            })
+            .filter(|&ci| ci < all.len());
+        on_line.or_else(|| {
+            let id = self.comment_sel?;
+            let ci = all.iter().position(|c| c.id == id)?;
+            (show_closed || all[ci].closed.is_none()).then_some(ci)
+        })
+    }
+
+    /// Saves the body of comment `c` (new unless `existing`); empty text deletes it.
+    fn save_body(
+        &mut self,
+        mut c: Comment,
+        existing: bool,
+        body: &str,
+    ) -> anyhow::Result<Option<&'static str>> {
+        let id = c.id;
+        if body.is_empty() {
+            if !existing {
+                return Ok(None);
+            }
+            self.comments.remove(id)?;
+            if self.comment_sel == Some(id) {
+                (self.comment_sel, self.reply_sel) = (None, None);
+            }
+            return Ok(Some("Comment deleted"));
+        }
+        c.body = body.to_string();
+        c.updated = comments::now().0;
+        let found = if existing {
+            // Only what the input changed: the comment may have been moved to a commit
+            // (or edited by another instance) meanwhile.
+            self.comments.edit(id, |s| {
+                // New text is new feedback: it reopens a closed comment.
+                if s.body != c.body {
+                    s.closed = None;
+                }
+                s.body = c.body;
+                s.updated = c.updated;
+                if s.commit == c.commit {
+                    (s.side, s.line, s.line_text, s.start) = (c.side, c.line, c.line_text, c.start);
+                }
+            })?
+        } else {
+            self.comments.upsert(c)?;
+            true
+        };
+        if !found {
+            anyhow::bail!("it was deleted elsewhere");
+        }
+        self.select_comment(Some(id));
+        Ok(Some("Comment saved"))
+    }
+
+    /// Saves reply `reply` of comment `id` (a new one when `None`); empty text deletes it.
+    /// Replies never open or close the comment.
+    fn save_reply(
+        &mut self,
+        id: u64,
+        reply: Option<u64>,
+        body: &str,
+    ) -> anyhow::Result<Option<&'static str>> {
+        let (found, msg) = match (reply, body.is_empty()) {
+            (None, true) => return Ok(None),
+            (Some(r), true) => {
+                let found = self.comments.remove_reply(id, r)?;
+                if self.reply_sel == Some(r) {
+                    self.reply_sel = None;
+                }
+                (found, "Reply deleted")
+            }
+            (Some(r), false) => (self.comments.edit_reply(id, r, body)?, "Reply saved"),
+            (None, false) => {
+                let new = Reply::new("user", body);
+                let r = new.id;
+                let found = self.comments.add_reply(id, new)?;
+                if found {
+                    self.select_comment(Some(id));
+                    self.reply_sel = Some(r);
+                }
+                (found, "Reply saved")
+            }
+        };
+        if !found {
+            anyhow::bail!("it was deleted elsewhere");
+        }
+        Ok(Some(msg))
     }
 
     /// Highlights the comment on the selected diff line, if there is one.
@@ -345,9 +462,18 @@ pub struct CommentInput {
     wt: PathBuf,
     /// Diff line the input is shown below.
     pub at: usize,
-    /// The comment to save; its body is replaced with the edited text.
-    pub comment: Comment,
-    existing: bool,
+    pub target: Target,
+}
+
+/// What a comment input saves its text to.
+pub enum Target {
+    /// The comment's body; `existing` when editing a saved one.
+    Comment {
+        comment: Box<Comment>,
+        existing: bool,
+    },
+    /// A reply to comment `comment`: a new one, or editing reply `reply`.
+    Reply { comment: u64, reply: Option<u64> },
 }
 
 /// Canonical git directory of a worktree; empty when it cannot be read (yet).
@@ -1167,6 +1293,7 @@ impl App {
                 self.step_comment(action == Action::NextComment)
             }
             Action::CloseComment => self.toggle_closed_comment(),
+            Action::Reply => self.start_reply(),
             Action::ToggleClosed => {
                 self.show_closed = !self.show_closed;
                 for st in &mut self.wts {
@@ -1461,24 +1588,8 @@ impl App {
         let Some(st) = self.wts.get_mut(self.active) else {
             return;
         };
-        // The comment shown below the line, else one whose range covers it.
-        let on_line = st
-            .diff_sel
-            .and_then(|s| {
-                let below = st.anchors.by_line.get(&s).map(|a| a.comment);
-                below.or_else(|| st.anchors.covering(s))
-            })
-            .and_then(|ci| st.comments.comments.get(ci));
-        let visible = |c: &&Comment| show_closed || c.closed.is_none();
-        let target = on_line.or_else(|| {
-            let id = st.comment_sel?;
-            st.comments
-                .comments
-                .iter()
-                .find(|c| c.id == id)
-                .filter(visible)
-        });
-        let Some(c) = target else {
+        let target = st.target_comment(show_closed);
+        let Some(c) = target.map(|ci| &st.comments.comments[ci]) else {
             self.notify("Select a commented line or a comment to close".into(), true);
             return;
         };
@@ -1497,16 +1608,22 @@ impl App {
         self.notify(msg.into(), false);
     }
 
-    /// Jumps to the comment after/before the highlighted one in pane order.
+    /// Jumps to the comment or reply after/before the highlighted one in pane order.
     fn step_comment(&mut self, forward: bool) {
         let Some(st) = self.active() else { return };
         let order = st.comment_order(self.show_closed);
         let all = &st.comments.comments;
-        let cur = st
-            .comment_sel
-            .and_then(|id| order.iter().position(|&ci| all[ci].id == id));
-        let Some(next) = comments::step(order.len(), cur, forward) else {
-            let msg = match (order.is_empty(), forward) {
+        let entries = comments::entries(all, &order);
+        let cur = st.comment_sel.and_then(|id| {
+            let at = |reply| {
+                entries
+                    .iter()
+                    .position(|&(ci, r)| all[ci].id == id && r == reply)
+            };
+            at(st.reply_sel).or_else(|| at(None))
+        });
+        let Some(next) = comments::step(entries.len(), cur, forward) else {
+            let msg = match (entries.is_empty(), forward) {
                 (true, _) => "No comments",
                 (false, true) => "No more comments",
                 (false, false) => "No previous comments",
@@ -1514,8 +1631,18 @@ impl App {
             self.notify(msg.into(), true);
             return;
         };
-        let id = all[order[next]].id;
+        let (ci, reply) = entries[next];
+        self.jump_to_entry(all[ci].id, reply);
+    }
+
+    /// Highlights comment `id`, or its reply `reply`, and shows the comment.
+    fn jump_to_entry(&mut self, id: u64, reply: Option<u64>) {
         self.jump_to_comment(id);
+        if let Some(st) = self.wts.get_mut(self.active)
+            && st.comment_sel == Some(id)
+        {
+            st.reply_sel = reply;
+        }
     }
 
     /// Highlights comment `id` and shows it: selects its commit, file and line.
@@ -1642,7 +1769,27 @@ impl App {
         };
         let start = (first != at).then_some(start);
         let shown = st.anchors.by_line.get(&at);
-        let (comment, existing) = match shown.and_then(|a| st.comments.comments.get(a.comment)) {
+        let shown = shown.and_then(|a| st.comments.comments.get(a.comment));
+        // A highlighted reply of the comment there is edited instead of the comment.
+        let reply = shown
+            .filter(|c| st.comment_sel == Some(c.id))
+            .and_then(|c| {
+                let r = c.replies.iter().find(|r| Some(r.id) == st.reply_sel)?;
+                Some((c.id, r))
+            });
+        if let Some((id, r)) = reply {
+            self.input = Some(CommentInput {
+                edit: LineInput::new(&r.body),
+                wt: st.info.path.clone(),
+                at,
+                target: Target::Reply {
+                    comment: id,
+                    reply: Some(r.id),
+                },
+            });
+            return;
+        }
+        let (comment, existing) = match shown {
             // Re-anchored comments move to where they are shown now; a newly selected range
             // replaces theirs.
             Some(c) => (
@@ -1670,6 +1817,7 @@ impl App {
                     created: secs,
                     updated: secs,
                     closed: None,
+                    replies: Vec::new(),
                 };
                 (comment, false)
             }
@@ -1678,60 +1826,60 @@ impl App {
             edit: LineInput::new(&comment.body),
             wt: st.info.path.clone(),
             at,
-            comment,
-            existing,
+            target: Target::Comment {
+                comment: Box::new(comment),
+                existing,
+            },
         });
     }
 
-    /// Saves the edited comment; empty text deletes it.
+    /// Opens a reply input below the comment on the selected line, else the one highlighted
+    /// in the pane if it is shown in the diff.
+    fn start_reply(&mut self) {
+        let show_closed = self.show_closed;
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        let Some(ci) = st.target_comment(show_closed) else {
+            self.notify(
+                "Select a commented line or a comment to reply to".into(),
+                true,
+            );
+            return;
+        };
+        let at = st.anchors.by_line.iter().find(|(_, a)| a.comment == ci);
+        let Some(at) = at.map(|(&at, _)| at) else {
+            self.notify("Jump to the comment first (Ctrl-n / Ctrl-p)".into(), true);
+            return;
+        };
+        let id = st.comments.comments[ci].id;
+        st.select_comment(Some(id));
+        self.input = Some(CommentInput {
+            edit: LineInput::default(),
+            wt: st.info.path.clone(),
+            at,
+            target: Target::Reply {
+                comment: id,
+                reply: None,
+            },
+        });
+    }
+
+    /// Saves the edited comment or reply; empty text deletes it.
     fn save_comment(&mut self, i: usize, input: CommentInput) {
         let st = &mut self.wts[i];
         let body = input.edit.text.trim();
-        let mut c = input.comment;
-        let id = c.id;
-        let res = if body.is_empty() {
-            if !input.existing {
-                return;
+        let (what, res) = match input.target {
+            Target::Comment { comment, existing } => {
+                ("comment", st.save_body(*comment, existing, body))
             }
-            let res = st.comments.remove(id).map(|()| "Comment deleted");
-            if res.is_ok() && st.comment_sel == Some(id) {
-                st.comment_sel = None;
-            }
-            res
-        } else {
-            c.body = body.to_string();
-            c.updated = comments::now().0;
-            let res = if input.existing {
-                // Only what the input changed: the comment may have been moved to a commit
-                // (or edited by another instance) meanwhile.
-                st.comments.edit(id, |s| {
-                    // New text is new feedback: it reopens a closed comment.
-                    if s.body != c.body {
-                        s.closed = None;
-                    }
-                    s.body = c.body;
-                    s.updated = c.updated;
-                    if s.commit == c.commit {
-                        (s.side, s.line, s.line_text, s.start) =
-                            (c.side, c.line, c.line_text, c.start);
-                    }
-                })
-            } else {
-                st.comments.upsert(c).map(|()| true)
-            };
-            match res {
-                Ok(true) => {
-                    st.select_comment(Some(id));
-                    Ok("Comment saved")
-                }
-                Ok(false) => Err(anyhow::anyhow!("it was deleted elsewhere")),
-                Err(e) => Err(e),
-            }
+            Target::Reply { comment, reply } => ("reply", st.save_reply(comment, reply, body)),
         };
         st.reanchor(self.show_closed);
         match res {
-            Ok(msg) => self.notify(msg.into(), false),
-            Err(e) => self.notify(format!("Saving comment failed: {e:#}"), true),
+            Ok(None) => {}
+            Ok(Some(msg)) => self.notify(msg.into(), false),
+            Err(e) => self.notify(format!("Saving {what} failed: {e:#}"), true),
         }
     }
 
@@ -1790,10 +1938,10 @@ impl App {
                         }
                     }
                     Pane::Comments => {
-                        if let Some(id) =
+                        if let Some((id, reply)) =
                             crate::ui::comment_at_row(st, self.show_closed, rel, rect.width)
                         {
-                            self.jump_to_comment(id);
+                            self.jump_to_entry(id, reply);
                         }
                     }
                 }

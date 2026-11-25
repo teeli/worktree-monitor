@@ -46,6 +46,42 @@ pub struct Comment {
     /// Set once the comment is handled (fixed or dropped); closed comments are hidden by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<Closed>,
+    /// Replies, oldest first. They never open or close the comment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Reply>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reply {
+    /// Unique within the comment (creation time in nanoseconds).
+    pub id: u64,
+    /// Who wrote it: "user" from the TUI, else whatever `wtm comments reply --by` was given.
+    pub by: String,
+    pub body: String,
+    /// Unix seconds.
+    pub created: u64,
+    pub updated: u64,
+}
+
+impl Reply {
+    pub fn new(by: &str, body: &str) -> Self {
+        let (secs, nanos) = now();
+        Reply {
+            id: nanos,
+            by: by.to_string(),
+            body: body.to_string(),
+            created: secs,
+            updated: secs,
+        }
+    }
+}
+
+impl Comment {
+    /// Newest change to the comment or its replies, in Unix seconds.
+    pub fn touched(&self) -> u64 {
+        let replies = self.replies.iter().map(|r| r.created.max(r.updated));
+        replies.fold(self.created.max(self.updated), u64::max)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,7 +369,7 @@ fn scan_in(dir: &Path) -> Result<Vec<Entry>> {
                 },
             }
         };
-        let touched = match file.comments.iter().map(|c| c.created.max(c.updated)).max() {
+        let touched = match file.comments.iter().map(Comment::touched).max() {
             Some(t) => t,
             // Unknown counts as now, so it never looks old.
             None => std::fs::metadata(&path)
@@ -509,6 +545,35 @@ impl Store {
         })
     }
 
+    /// Appends `reply` to comment `id`. Returns whether the comment exists.
+    pub fn add_reply(&mut self, id: u64, reply: Reply) -> Result<bool> {
+        self.edit(id, |c| c.replies.push(reply))
+    }
+
+    /// Replaces the body of reply `reply` of comment `id`. Returns whether the reply exists.
+    pub fn edit_reply(&mut self, id: u64, reply: u64, body: &str) -> Result<bool> {
+        let mut found = false;
+        self.edit(id, |c| {
+            if let Some(r) = c.replies.iter_mut().find(|r| r.id == reply) {
+                r.body = body.to_string();
+                r.updated = now().0;
+                found = true;
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// Deletes reply `reply` of comment `id`. Returns whether it existed.
+    pub fn remove_reply(&mut self, id: u64, reply: u64) -> Result<bool> {
+        let mut found = false;
+        self.edit(id, |c| {
+            let before = c.replies.len();
+            c.replies.retain(|r| r.id != reply);
+            found = c.replies.len() != before;
+        })?;
+        Ok(found)
+    }
+
     /// Moves working tree comments to the commits their lines were committed in.
     pub fn move_to_commits(&mut self, moves: &[(u64, String)]) -> Result<()> {
         self.modify(|all| {
@@ -609,6 +674,18 @@ pub fn order(
         (group, c.file.clone(), c.line)
     });
     idx
+}
+
+/// Thread entries of the comments at `order` (indices into `comments`), in that order: each
+/// comment (`None`) followed by its replies (their ids).
+pub fn entries(comments: &[Comment], order: &[usize]) -> Vec<(usize, Option<u64>)> {
+    order
+        .iter()
+        .flat_map(|&ci| {
+            let replies = comments[ci].replies.iter().map(move |r| (ci, Some(r.id)));
+            std::iter::once((ci, None)).chain(replies)
+        })
+        .collect()
 }
 
 /// Position after/before `cur` in a list of `len`; from outside the list (`None`) the first or
@@ -726,6 +803,7 @@ mod tests {
             created: 0,
             updated: 0,
             closed: None,
+            replies: Vec::new(),
         }
     }
 
@@ -757,11 +835,27 @@ mod tests {
             at: 1,
             by: "user".into(),
         });
+        c.replies.push(Reply::new("claude", "done"));
         let json = serde_json::to_value(&c).unwrap();
         let defs = &schema["$defs"];
         assert_eq!(keys(&json), keys(&defs["comment"]["properties"]));
         assert_eq!(keys(&json["start"]), keys(&defs["linePos"]["properties"]));
         assert_eq!(keys(&json["closed"]), keys(&defs["closed"]["properties"]));
+        let reply = &json["replies"][0];
+        assert_eq!(keys(reply), keys(&defs["reply"]["properties"]));
+        assert_eq!(keys(reply), {
+            let mut r: Vec<String> = defs["reply"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            r.sort();
+            r
+        });
+        // Optional fields are left out when unset.
+        let bare = serde_json::to_value(comment(1, Side::New, 1, "x", None)).unwrap();
+        assert!(bare.get("replies").is_none());
         let file = CommentFile {
             schema: Some("x".into()),
             version: VERSION,
@@ -822,6 +916,31 @@ mod tests {
         assert!(s.set_closed(2, None).unwrap());
         assert!(s.comments[0].closed.is_none());
         assert!(!s.set_closed(99, None).unwrap());
+
+        // Replies are added, edited and removed without touching the comment's state.
+        s.set_closed(2, Some(first.clone())).unwrap();
+        let r1 = Reply {
+            id: 10,
+            ..Reply::new("claude", "fixed")
+        };
+        let r2 = Reply {
+            id: 11,
+            ..Reply::new("user", "thanks")
+        };
+        assert!(s.add_reply(2, r1.clone()).unwrap());
+        assert!(s.add_reply(2, r2.clone()).unwrap());
+        assert!(!s.add_reply(99, r1.clone()).unwrap());
+        assert!(s.edit_reply(2, 10, "fixed in abc").unwrap());
+        assert!(!s.edit_reply(2, 99, "x").unwrap());
+        let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
+        let bodies: Vec<&str> = stored.replies.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, ["fixed in abc", "thanks"]);
+        assert_eq!(stored.closed.as_ref(), Some(&first));
+        assert!(s.remove_reply(2, 10).unwrap());
+        assert!(!s.remove_reply(2, 10).unwrap());
+        assert_eq!(s.comments[0].replies, vec![r2]);
+        assert_eq!(s.comments[0].closed.as_ref(), Some(&first));
+        s.set_closed(2, None).unwrap();
 
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, repo, Some(path.clone()));
@@ -940,6 +1059,33 @@ mod tests {
             text: "missing".into(),
         });
         assert_eq!(r(range), None);
+    }
+
+    #[test]
+    fn lists_thread_entries() {
+        let mut cs = vec![
+            comment(1, Side::New, 1, "x", None),
+            comment(2, Side::New, 2, "x", None),
+        ];
+        for id in [7, 8] {
+            cs[1].replies.push(Reply {
+                id,
+                ..Reply::new("a", "r")
+            });
+        }
+        assert_eq!(
+            entries(&cs, &[1, 0]),
+            vec![(1, None), (1, Some(7)), (1, Some(8)), (0, None)]
+        );
+        // The newest reply counts as a change.
+        assert_eq!(cs[0].touched(), 0);
+        (cs[1].replies[0].created, cs[1].replies[0].updated) = (0, 0);
+        cs[1].replies[1] = Reply {
+            created: 5,
+            updated: 9,
+            ..cs[1].replies[1].clone()
+        };
+        assert_eq!(cs[1].touched(), 9);
     }
 
     #[test]

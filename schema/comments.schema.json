@@ -91,7 +91,32 @@
         "closed": {
           "description": "Set once the comment is handled (fixed or dropped); absent while it is open.",
           "$ref": "#/$defs/closed"
+        },
+        "replies": {
+          "description": "Replies to the comment, oldest first; absent when there are none. Adding, editing or deleting a reply never opens or closes the comment.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/reply" }
         }
+      }
+    },
+    "reply": {
+      "type": "object",
+      "required": ["id", "by", "body", "created", "updated"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Unique within the comment (creation time in nanoseconds).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "by": {
+          "description": "Who wrote it: \"user\" from the TUI, else the name given to `wtm comments reply --by` (e.g. an agent's).",
+          "type": "string",
+          "minLength": 1
+        },
+        "body": { "type": "string", "minLength": 1 },
+        "created": { "$ref": "#/$defs/unixTime" },
+        "updated": { "$ref": "#/$defs/unixTime" }
       }
     },
     "closed": {

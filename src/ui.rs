@@ -1,6 +1,6 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
-use crate::app::{App, CommentInput, WtState};
+use crate::app::{App, CommentInput, Target, WtState};
 use crate::comments::Comment;
 use crate::diff::{Diff, LineKind};
 use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
@@ -498,8 +498,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             });
         }
         let Some(note) = note else { continue };
-        let editing = note.cursor.is_some();
-        let frame = if editing {
+        let frame = if note.editing {
             theme.popup_border
         } else if note.closed {
             theme.dim
@@ -515,23 +514,27 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             let spans = vec![Span::styled("│ ", frame), Span::styled(text, style)];
             Line::from(fit_spans(spans, width))
         };
-        let body = note.rows(width);
-        let at = note.cursor_at(&body);
+        let text_style = if note.closed {
+            theme.dim
+        } else {
+            theme.comment_text
+        };
         let mut rows = vec![rule("├")];
-        for (k, text) in body.into_iter().enumerate() {
-            if at.is_some_and(|(r, _)| r == k) && out.len() + rows.len() < h {
-                cursor = at.map(|(_, c)| (2 + c, out.len() + rows.len()));
+        for r in note.rows(width) {
+            if let Some(col) = r.cursor
+                && out.len() + rows.len() < h
+            {
+                cursor = Some((2 + r.indent + col, out.len() + rows.len()));
             }
-            let style = if editing {
+            let seg = &note.segs[r.seg];
+            let style = if seg.cursor.is_some() {
                 theme.base
-            } else if note.closed {
-                theme.dim
             } else {
-                theme.comment_text
+                text_style
             };
-            rows.push(row(text.to_string(), style));
+            rows.push(thread_row(&r, frame, style, seg.selected, width, &theme));
         }
-        if editing {
+        if note.editing {
             rows.push(row(
                 "Enter save · Esc cancel · empty deletes".into(),
                 theme.dim,
@@ -565,59 +568,195 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Text shown below a diff line: its comment, or the comment being edited there.
-struct Note<'a> {
+/// One entry of a comment thread: the comment's body or a reply.
+struct Seg<'a> {
+    /// Author of a reply, shown above it as `↳ by`; `None` for the comment's body.
+    by: Option<&'a str>,
     text: &'a str,
-    /// Byte offset of the input cursor while editing.
+    /// Byte offset of the input cursor while this entry is edited.
     cursor: Option<usize>,
+    /// The highlighted entry.
+    selected: bool,
+}
+
+/// A comment thread, shown below a diff line or in the comments pane; while an input is open
+/// in it, one entry is the edited text.
+struct Note<'a> {
+    segs: Vec<Seg<'a>>,
+    /// An input is open in the thread.
+    editing: bool,
     /// A closed comment, shown dimmed.
     closed: bool,
 }
 
+/// A screen row of a thread (after the `│ ` bar): a reply's author or a slice of an entry.
+#[derive(Debug, PartialEq, Eq)]
+struct ThreadRow<'a> {
+    /// Index into `Note::segs`.
+    seg: usize,
+    /// The author line of a reply, rather than text.
+    header: bool,
+    text: &'a str,
+    /// Columns before `text`.
+    indent: usize,
+    /// Column of the input cursor within `text`.
+    cursor: Option<usize>,
+}
+
+/// Columns replies are indented by, below their `↳ ` author line.
+const REPLY_INDENT: usize = 2;
+
 impl<'a> Note<'a> {
-    /// Wrapped text rows (after the `│ ` bar) in a pane `width` columns wide.
-    fn rows(&self, width: usize) -> Vec<&'a str> {
-        wrap_ranges(self.text, width.saturating_sub(2))
-    }
-
-    /// Screen rows: the text, the key hint while editing, and the rules above and below.
-    fn height(&self, width: usize) -> usize {
-        self.rows(width).len() + usize::from(self.cursor.is_some()) + 2
-    }
-
-    /// Row and column of the cursor within `rows` (consecutive slices of the text).
-    fn cursor_at(&self, rows: &[&str]) -> Option<(usize, usize)> {
-        let b = self.cursor?;
-        let mut start = 0;
-        for (r, row) in rows.iter().enumerate() {
-            if b < start + row.len() || r + 1 == rows.len() {
-                return Some((r, self.text[start..b].width()));
-            }
-            start += row.len();
+    /// The thread of `c`; `sel` highlights its body (`Some(None)`) or a reply.
+    fn thread(c: &'a Comment, sel: Option<Option<u64>>) -> Self {
+        let body = Seg {
+            by: None,
+            text: &c.body,
+            cursor: None,
+            selected: sel == Some(None),
+        };
+        let replies = c.replies.iter().map(|r| Seg {
+            by: Some(&r.by),
+            text: &r.body,
+            cursor: None,
+            selected: sel == Some(Some(r.id)),
+        });
+        Note {
+            segs: std::iter::once(body).chain(replies).collect(),
+            editing: false,
+            closed: c.closed.is_some(),
         }
-        None
+    }
+
+    /// Wrapped rows of the thread in a pane `width` columns wide.
+    fn rows(&self, width: usize) -> Vec<ThreadRow<'a>> {
+        let mut out = Vec::new();
+        for (k, seg) in self.segs.iter().enumerate() {
+            if let Some(by) = seg.by {
+                out.push(ThreadRow {
+                    seg: k,
+                    header: true,
+                    text: by,
+                    indent: 0,
+                    cursor: None,
+                });
+            }
+            let indent = if seg.by.is_some() { REPLY_INDENT } else { 0 };
+            let parts: Vec<&str> = seg
+                .text
+                .split('\n')
+                .flat_map(|l| wrap_ranges(l, width.saturating_sub(2 + indent)))
+                .collect();
+            let at = seg.cursor.and_then(|b| cursor_at(seg.text, &parts, b));
+            for (r, text) in parts.into_iter().enumerate() {
+                out.push(ThreadRow {
+                    seg: k,
+                    header: false,
+                    text,
+                    indent,
+                    cursor: at.filter(|&(row, _)| row == r).map(|(_, col)| col),
+                });
+            }
+        }
+        out
+    }
+
+    /// Screen rows below a diff line: the thread, the key hint while editing, and the rules
+    /// above and below.
+    fn height(&self, width: usize) -> usize {
+        self.rows(width).len() + usize::from(self.editing) + 2
     }
 }
 
-fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Option<Note<'a>> {
-    if let Some(input) = input.filter(|inp| inp.at == i) {
-        let e = &input.edit;
-        let cursor = e.cursor_byte();
-        return Some(Note {
-            text: &e.text,
-            cursor: Some(cursor),
-            closed: false,
-        });
+/// Row and column of byte offset `b` of `text` within `rows`, consecutive slices of it.
+fn cursor_at(text: &str, rows: &[&str], b: usize) -> Option<(usize, usize)> {
+    let base = text.as_ptr() as usize;
+    for (r, row) in rows.iter().enumerate() {
+        let start = row.as_ptr() as usize - base;
+        if b < start + row.len() || r + 1 == rows.len() {
+            return Some((r, text[start..b.max(start)].width()));
+        }
     }
-    let c = st
-        .comments
-        .comments
-        .get(st.anchors.by_line.get(&i)?.comment)?;
-    Some(Note {
-        text: &c.body,
-        cursor: None,
-        closed: c.closed.is_some(),
-    })
+    None
+}
+
+/// A thread row after the `│ ` bar (in `bar` style): an author line, or text in `style`.
+fn thread_row<'a>(
+    r: &ThreadRow<'a>,
+    bar: Style,
+    style: Style,
+    selected: bool,
+    width: usize,
+    theme: &Theme,
+) -> Line<'a> {
+    let (text, style) = if r.header {
+        (format!("↳ {}", r.text), theme.dim)
+    } else {
+        (format!("{}{}", " ".repeat(r.indent), r.text), style)
+    };
+    let spans = fit_spans(
+        vec![Span::styled("│ ", bar), Span::styled(text, style)],
+        width,
+    );
+    if selected {
+        patch_row(spans, theme.diff_sel)
+    } else {
+        Line::from(spans)
+    }
+}
+
+/// The thread shown below diff line `i`, with the open input if it belongs there.
+fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Option<Note<'a>> {
+    let all = &st.comments.comments;
+    let shown = st.anchors.by_line.get(&i).and_then(|a| all.get(a.comment));
+    let Some(input) = input.filter(|inp| inp.at == i) else {
+        let c = shown?;
+        // Only a highlighted reply stands out here; the pane highlights the comment.
+        let sel = st.reply_sel.filter(|_| st.comment_sel == Some(c.id));
+        return Some(Note::thread(c, sel.map(Some)));
+    };
+    let edit = Seg {
+        by: None,
+        text: &input.edit.text,
+        cursor: Some(input.edit.cursor_byte()),
+        selected: false,
+    };
+    let find = |id: u64| all.iter().find(|c| c.id == id);
+    let (thread, slot) = match &input.target {
+        Target::Comment {
+            comment,
+            existing: true,
+        } => (find(comment.id), Some(0)),
+        Target::Comment { .. } => (None, None),
+        Target::Reply { comment, reply } => {
+            let c = find(*comment);
+            let slot = reply.and_then(|r| Some(1 + c?.replies.iter().position(|x| x.id == r)?));
+            (c, slot)
+        }
+    };
+    let mut note = match thread {
+        Some(c) => Note::thread(c, None),
+        None => Note {
+            segs: Vec::new(),
+            editing: false,
+            closed: false,
+        },
+    };
+    note.editing = true;
+    match slot {
+        Some(k) if k < note.segs.len() => {
+            note.segs[k] = Seg {
+                by: note.segs[k].by,
+                ..edit
+            }
+        }
+        // A new comment, or a new reply at the end of its thread.
+        _ => note.segs.push(Seg {
+            by: matches!(input.target, Target::Reply { .. }).then_some("user"),
+            ..edit
+        }),
+    }
+    Some(note)
 }
 
 /// Whether `st.comments.comments[ci]` is closed.
@@ -709,24 +848,37 @@ fn row_to_line(offset: usize, len: usize, rel: usize, rows: impl Fn(usize) -> us
     len
 }
 
-/// Screen rows of a comments pane entry `width` columns wide: header, body, blank separator.
+/// Screen rows of a comments pane entry `width` columns wide: header, thread, blank separator.
 fn entry_rows(c: &Comment, width: usize) -> usize {
-    wrap_ranges(&c.body, width.saturating_sub(2)).len() + 2
+    Note::thread(c, None).rows(width).len() + 2
 }
 
-/// Id of the comment drawn at screen row `rel` of the comments pane.
+/// Id of the comment drawn at screen row `rel` of the comments pane, and of the reply if the
+/// row is one of its rows.
 pub fn comment_at_row(
     st: &WtState,
     show_closed: bool,
     rel: usize,
     inner_width: u16,
-) -> Option<u64> {
+) -> Option<(u64, Option<u64>)> {
     let order = st.comment_order(show_closed);
     let all = &st.comments.comments;
-    let i = row_to_line(st.comments_offset, order.len(), rel, |i| {
-        entry_rows(&all[order[i]], inner_width as usize)
-    });
-    order.get(i).map(|&ci| all[ci].id)
+    let mut top = 0;
+    for &ci in order.iter().skip(st.comments_offset) {
+        let c = &all[ci];
+        let rows = Note::thread(c, None).rows(inner_width as usize);
+        if rel < top + rows.len() + 2 {
+            // Below the header: the thread's rows, then the blank separator.
+            let seg = rel
+                .checked_sub(top + 1)
+                .and_then(|k| rows.get(k))
+                .map(|r| r.seg);
+            let reply = seg.and_then(|k| Some(c.replies.get(k.checked_sub(1)?)?.id));
+            return Some((c.id, reply));
+        }
+        top += rows.len() + 2;
+    }
+    None
 }
 
 fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
@@ -805,7 +957,14 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             },
         };
-        let closed = if c.closed.is_some() { " · closed" } else { "" };
+        let mut closed = match c.replies.len() {
+            0 => String::new(),
+            1 => " · 1 reply".into(),
+            n => format!(" · {n} replies"),
+        };
+        if c.closed.is_some() {
+            closed += " · closed";
+        }
         let (file_style, bar_style, body_style) = if c.closed.is_some() {
             (theme.dim, theme.dim, theme.dim)
         } else {
@@ -820,21 +979,17 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(tag, tag_style),
             Span::styled(closed, theme.dim),
         ];
-        let mut rows = vec![fit_spans(header, w)];
-        for text in wrap_ranges(&c.body, w.saturating_sub(2)) {
-            let spans = vec![
-                Span::styled("│ ", bar_style),
-                Span::styled(text.to_string(), body_style),
-            ];
-            rows.push(fit_spans(spans, w));
-        }
         let selected = sel == Some(i);
-        for spans in rows {
-            out.push(if selected {
-                patch_row(spans, theme.diff_sel)
-            } else {
-                Line::from(spans)
-            });
+        out.push(if selected {
+            patch_row(fit_spans(header, w), theme.diff_sel)
+        } else {
+            Line::from(fit_spans(header, w))
+        });
+        // The highlighted entry: the comment itself or one of its replies.
+        let note = Note::thread(c, selected.then_some(st.reply_sel));
+        for r in note.rows(w) {
+            let selected = note.segs[r.seg].selected;
+            out.push(thread_row(&r, bar_style, body_style, selected, w, &theme));
         }
         out.push(Line::raw(""));
     }
@@ -1133,20 +1288,74 @@ mod tests {
     #[test]
     fn places_note_cursor() {
         let note = |text, cursor| Note {
-            text,
-            cursor: Some(cursor),
+            segs: vec![Seg {
+                by: None,
+                text,
+                cursor: Some(cursor),
+                selected: false,
+            }],
+            editing: true,
             closed: false,
         };
+        let texts = |n: &Note| -> Vec<String> { n.rows(7).iter().map(|r| r.text.into()).collect() };
+        let cursors =
+            |n: &Note| -> Vec<Option<usize>> { n.rows(7).iter().map(|r| r.cursor).collect() };
         // Width 7 → 5 columns of note text after the bar.
         let n = note("abcd efgh", 5);
-        let rows = n.rows(7);
-        assert_eq!(rows, vec!["abcd ", "efgh"]);
-        assert_eq!(n.cursor_at(&rows), Some((1, 0)));
+        assert_eq!(texts(&n), vec!["abcd ", "efgh"]);
+        assert_eq!(cursors(&n), vec![None, Some(0)]);
         assert_eq!(n.height(7), 5);
         let n = note("abcd efgh", 9);
-        assert_eq!(n.cursor_at(&n.rows(7)), Some((1, 4)));
+        assert_eq!(cursors(&n), vec![None, Some(4)]);
         let n = note("", 0);
-        assert_eq!(n.cursor_at(&n.rows(7)), Some((0, 0)));
+        assert_eq!(cursors(&n), vec![Some(0)]);
+    }
+
+    #[test]
+    fn lays_out_threads() {
+        let mut c = crate::comments::Comment {
+            id: 1,
+            file: "f".into(),
+            side: crate::comments::Side::New,
+            line: 1,
+            line_text: "x".into(),
+            start: None,
+            commit: None,
+            head: None,
+            body: "abcd efgh".into(),
+            created: 0,
+            updated: 0,
+            closed: None,
+            replies: Vec::new(),
+        };
+        for (id, body) in [(7, "ok"), (8, "one\ntwo")] {
+            c.replies.push(crate::comments::Reply {
+                id,
+                ..crate::comments::Reply::new("claude", body)
+            });
+        }
+        let n = Note::thread(&c, Some(Some(8)));
+        let rows: Vec<(usize, bool, &str, usize)> = n
+            .rows(7)
+            .iter()
+            .map(|r| (r.seg, r.header, r.text, r.indent))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (0, false, "abcd ", 0),
+                (0, false, "efgh", 0),
+                (1, true, "claude", 0),
+                (1, false, "ok", 2),
+                (2, true, "claude", 0),
+                (2, false, "one", 2),
+                (2, false, "two", 2),
+            ]
+        );
+        let sel: Vec<bool> = n.segs.iter().map(|s| s.selected).collect();
+        assert_eq!(sel, vec![false, false, true]);
+        assert_eq!(entry_rows(&c, 7), 9);
+        assert_eq!(n.height(7), 9);
     }
 
     #[test]

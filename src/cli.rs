@@ -1,16 +1,17 @@
-//! `wtm comments …`: reading and closing the current worktree's comments without the TUI,
-//! e.g. by an AI agent that handled them, and cleaning up comment files of removed worktrees.
+//! `wtm comments …`: reading, replying to and closing the current worktree's comments without
+//! the TUI, e.g. by an AI agent that handled them, and cleaning up comment files of removed
+//! worktrees.
 
-use crate::comments::{self, Closed, Comment, Entry, Gone, Store};
+use crate::comments::{self, Closed, Comment, Entry, Gone, Reply, Store};
 use crate::git;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List, close or reopen the comments of the current worktree; `prune` cleans up stale
+    /// List, reply to, close or reopen the comments of the current worktree; `prune` cleans up stale
     /// comment files of all repositories.
     #[command(subcommand)]
     Comments(CommentsCmd),
@@ -28,15 +29,27 @@ pub enum CommentsCmd {
 /// Commands on the comments of the current worktree.
 #[derive(Subcommand)]
 pub enum WorktreeCmd {
-    /// List open comments: id, file:line, commit (if any), then the indented body.
+    /// List open comments: id, file:line, commit (if any), then the indented body and replies.
     List {
         /// Include closed comments.
         #[arg(long)]
         all: bool,
         /// Print the comments as a JSON array in the format of schema/comments.schema.json,
-        /// except that ids are strings: they exceed 2^53, which many JSON parsers round.
+        /// except that ids (of comments and replies) are strings: they exceed 2^53, which many
+        /// JSON parsers round.
         #[arg(long)]
         json: bool,
+    },
+    /// Reply to a comment, e.g. with how it was handled or a question. Doesn't open or close it.
+    Reply {
+        /// Id of the comment, as `list` prints it.
+        id: u64,
+        /// Who replies, e.g. the agent's name.
+        #[arg(long, default_value = "agent")]
+        by: String,
+        /// The reply; words are joined with spaces. `-` reads it from stdin.
+        #[arg(required = true, value_name = "TEXT")]
+        text: Vec<String>,
     },
     /// Close comments that were fixed or dropped.
     Close {
@@ -76,7 +89,8 @@ pub fn run(cmd: Command) -> Result<()> {
             let repo = git::discover(&std::env::current_dir()?)?;
             let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             let mut store = Store::load(&canon(&repo.toplevel), &canon(&repo.common_dir));
-            comments_cmd(cmd, &mut store, &mut std::io::stdout().lock())
+            let out = &mut std::io::stdout().lock();
+            comments_cmd(cmd, &mut store, &mut std::io::stdin().lock(), out)
         }
         CommentsCmd::Prune(args) => {
             let (dir, entries) = comments::scan()?;
@@ -87,12 +101,18 @@ pub fn run(cmd: Command) -> Result<()> {
     }
 }
 
-fn comments_cmd(cmd: WorktreeCmd, store: &mut Store, out: &mut impl Write) -> Result<()> {
+fn comments_cmd(
+    cmd: WorktreeCmd,
+    store: &mut Store,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<()> {
     if let Some(e) = &store.error {
         bail!("comments unreadable: {e}");
     }
     let (ids, closed) = match cmd {
         WorktreeCmd::List { all, json } => return list(store, all, json, out),
+        WorktreeCmd::Reply { id, by, text } => return reply(store, id, &by, &text, stdin, out),
         WorktreeCmd::Close { ids, by } => {
             if by.trim().is_empty() {
                 bail!("--by must not be empty");
@@ -120,6 +140,35 @@ fn comments_cmd(cmd: WorktreeCmd, store: &mut Store, out: &mut impl Write) -> Re
     Ok(())
 }
 
+fn reply(
+    store: &mut Store,
+    id: u64,
+    by: &str,
+    text: &[String],
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<()> {
+    if by.trim().is_empty() {
+        bail!("--by must not be empty");
+    }
+    let body = if text == ["-"] {
+        let mut buf = String::new();
+        stdin.read_to_string(&mut buf).context("reading stdin")?;
+        buf
+    } else {
+        text.join(" ")
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        bail!("the reply must not be empty");
+    }
+    if !store.add_reply(id, Reply::new(by, body))? {
+        bail!("no comment with id {id}");
+    }
+    writeln!(out, "Replied to {id}")?;
+    Ok(())
+}
+
 fn list(store: &Store, all: bool, json: bool, out: &mut impl Write) -> Result<()> {
     let shown: Vec<&Comment> = comments::order(&store.comments, all, |_| None)
         .into_iter()
@@ -131,6 +180,9 @@ fn list(store: &Store, all: bool, json: bool, out: &mut impl Write) -> Result<()
             .map(|c| {
                 let mut v = serde_json::to_value(c)?;
                 v["id"] = c.id.to_string().into();
+                for (r, reply) in c.replies.iter().enumerate() {
+                    v["replies"][r]["id"] = reply.id.to_string().into();
+                }
                 Ok(v)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -156,6 +208,12 @@ fn list(store: &Store, all: bool, json: bool, out: &mut impl Write) -> Result<()
         writeln!(out, "{head}")?;
         for line in c.body.lines() {
             writeln!(out, "    {line}")?;
+        }
+        for r in &c.replies {
+            writeln!(out, "    ↳ {}", r.by)?;
+            for line in r.body.lines() {
+                writeln!(out, "      {line}")?;
+            }
         }
     }
     Ok(())
@@ -256,12 +314,17 @@ mod tests {
             created: 0,
             updated: 0,
             closed: None,
+            replies: Vec::new(),
         }
     }
 
     fn run(store: &mut Store, cmd: WorktreeCmd) -> (Result<()>, String) {
+        run_with(store, cmd, "")
+    }
+
+    fn run_with(store: &mut Store, cmd: WorktreeCmd, stdin: &str) -> (Result<()>, String) {
         let mut out = Vec::new();
-        let res = comments_cmd(cmd, store, &mut out);
+        let res = comments_cmd(cmd, store, &mut stdin.as_bytes(), &mut out);
         (res, String::from_utf8(out).unwrap())
     }
 
@@ -322,6 +385,60 @@ mod tests {
             by: " ".into(),
         };
         assert!(run(&mut s, blank).0.is_err());
+    }
+
+    fn reply_cmd(id: u64, by: &str, text: &[&str]) -> WorktreeCmd {
+        WorktreeCmd::Reply {
+            id,
+            by: by.into(),
+            text: text.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
+        let mut s = Store::load_from(wt, repo, Some(path.clone()));
+        s.upsert(comment(1, 3, None)).unwrap();
+        s.set_closed(1, Some(Closed::now("user"))).unwrap();
+
+        let (res, out) = run(&mut s, reply_cmd(1, "claude", &["Fixed", "in", "abc"]));
+        res.unwrap();
+        assert_eq!(out, "Replied to 1\n");
+        let (res, _) = run_with(
+            &mut s,
+            reply_cmd(1, "claude", &["-"]),
+            "  why?\nreally?\n\n",
+        );
+        res.unwrap();
+        // Replies don't reopen.
+        let mut s = Store::load_from(wt, repo, Some(path.clone()));
+        let c = &s.comments[0];
+        assert!(c.closed.is_some());
+        let bodies: Vec<&str> = c.replies.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, ["Fixed in abc", "why?\nreally?"]);
+        assert!(c.replies.iter().all(|r| r.by == "claude"));
+
+        assert_eq!(
+            run(&mut s, list(true, false)).1,
+            "1  src/a.rs:3 · closed by user\n    fix 1\n    please\n\
+             \x20   ↳ claude\n      Fixed in abc\n\
+             \x20   ↳ claude\n      why?\n      really?\n"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&run(&mut s, list(true, true)).1).unwrap();
+        let r = &json[0]["replies"][1];
+        assert_eq!(r["id"], s.comments[0].replies[1].id.to_string());
+        assert_eq!(r["by"], "claude");
+
+        let err = |s: &mut Store, cmd, stdin| run_with(s, cmd, stdin).0.unwrap_err().to_string();
+        assert!(err(&mut s, reply_cmd(9, "a", &["x"]), "").contains('9'));
+        assert!(err(&mut s, reply_cmd(1, " ", &["x"]), "").contains("--by"));
+        assert!(err(&mut s, reply_cmd(1, "a", &[" "]), "").contains("empty"));
+        assert!(err(&mut s, reply_cmd(1, "a", &["-"]), "\n").contains("empty"));
+        assert_eq!(s.comments[0].replies.len(), 2);
     }
 
     #[test]
