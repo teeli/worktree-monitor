@@ -132,32 +132,13 @@ pub fn prune(repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
 }
 
 fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, None),
-        Err(e) => {
-            return (
-                0,
-                Some(anyhow!(e).context(format!("reading {}", dir.display()))),
-            );
-        }
+    let files = match comment_files(dir) {
+        Ok(f) => f,
+        Err(e) => return (0, Some(e)),
     };
     let mut removed = 0;
     let mut error = None;
-    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        // Files that can't be read are left alone, like `Store` never overwrites them.
-        let Some(mut file) = std::fs::read(&path)
-            .ok()
-            .and_then(|d| serde_json::from_slice::<CommentFile>(&d).ok())
-        else {
-            continue;
-        };
-        if path.file_name() != Some(file_name(&file.worktree).as_ref()) {
-            continue;
-        }
+    for (path, mut file) in files {
         let is_live = live.contains(&file.worktree.as_path());
         let res = match &file.repo {
             Some(r) if r == repo && !is_live => std::fs::remove_file(&path)
@@ -174,6 +155,184 @@ fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::E
         }
     }
     (removed, error)
+}
+
+/// The comment files in `dir` with their contents; none when `dir` doesn't exist. Files that
+/// can't be read, or whose name doesn't match their worktree, are left out (and so left alone,
+/// like `Store` never overwrites them).
+fn comment_files(dir: &Path) -> Result<impl Iterator<Item = (PathBuf, CommentFile)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => Some(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    Ok(entries
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter_map(|path| {
+            let file = serde_json::from_slice::<CommentFile>(&std::fs::read(&path).ok()?).ok()?;
+            (path.file_name() == Some(file_name(&file.worktree).as_ref())).then_some((path, file))
+        }))
+}
+
+/// Why the worktree of a comment file is considered gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Its repository exists but no longer has it.
+    Worktree,
+    /// Its repository exists and still lists it (e.g. on an unmounted volume, or deleted without
+    /// `git worktree remove`), or git can't tell. Never stale for being gone.
+    Listed,
+    /// Its repository is missing too, possibly only on a volume that isn't mounted.
+    Repo,
+    /// The file is from an older version that didn't record the repository.
+    Unknown,
+}
+
+/// Why a comment file is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    Gone(Gone),
+    /// Untouched for this many days.
+    Idle(u64),
+}
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Stale::Gone(Gone::Worktree) => f.write_str("worktree removed"),
+            Stale::Gone(Gone::Listed) => f.write_str("worktree missing"),
+            Stale::Gone(Gone::Repo) => f.write_str("repository missing"),
+            Stale::Gone(Gone::Unknown) => f.write_str("repository unknown"),
+            Stale::Idle(1) => f.write_str("untouched for 1 day"),
+            Stale::Idle(days) => write!(f, "untouched for {days} days"),
+        }
+    }
+}
+
+/// A comment file, as seen by `wtm prune`.
+#[derive(Debug)]
+pub struct Entry {
+    pub path: PathBuf,
+    pub worktree: PathBuf,
+    pub comments: usize,
+    /// `None` while the worktree exists, or may (e.g. its path is unreachable).
+    pub gone: Option<Gone>,
+    /// Unix seconds of the newest comment change; the file's mtime when it has no comments.
+    pub touched: u64,
+}
+
+impl Entry {
+    /// Whether the file is stale: its worktree is gone (`Gone::Worktree`, or any with
+    /// `deleted_repos`), or it was untouched for at least `max_age` days as of `now`.
+    pub fn stale(&self, deleted_repos: bool, max_age: Option<u64>, now: u64) -> Option<Stale> {
+        match self.gone {
+            Some(g @ Gone::Worktree) => return Some(Stale::Gone(g)),
+            Some(g @ (Gone::Repo | Gone::Unknown)) if deleted_repos => {
+                return Some(Stale::Gone(g));
+            }
+            _ => {}
+        }
+        let days = now.saturating_sub(self.touched) / 86_400;
+        max_age
+            .is_some_and(|max| days >= max)
+            .then_some(Stale::Idle(days))
+    }
+}
+
+/// The comments directory and all its comment files, across all repositories.
+pub fn scan() -> Result<(PathBuf, Vec<Entry>)> {
+    let dir =
+        comments_dir().ok_or_else(|| anyhow!("no state directory (set XDG_STATE_HOME or HOME)"))?;
+    let found = scan_in(&dir)?;
+    Ok((dir, found))
+}
+
+/// Worktrees a repository still lists, per git.
+struct Registered {
+    /// As git reports them, and canonical where they (or their parents) can be resolved.
+    paths: HashSet<PathBuf>,
+    /// Some listed worktree couldn't be resolved, or the main worktree's location isn't
+    /// recorded (`git init --separate-git-dir`): any missing worktree may be one of them.
+    unsure: bool,
+}
+
+fn scan_in(dir: &Path) -> Result<Vec<Entry>> {
+    let mut repos: HashMap<PathBuf, Option<Registered>> = HashMap::new();
+    let mut found = Vec::new();
+    for (path, file) in comment_files(dir)? {
+        // Unreachable (e.g. permission denied or a stale network mount) isn't gone.
+        let gone = if !matches!(file.worktree.try_exists(), Ok(false)) {
+            None
+        } else {
+            match &file.repo {
+                None => Some(Gone::Unknown),
+                Some(r) => match r.try_exists() {
+                    Ok(false) => Some(Gone::Repo),
+                    Err(_) => None,
+                    Ok(true) => {
+                        let reg = repos.entry(r.clone()).or_insert_with(|| registered(r));
+                        match reg {
+                            Some(reg) if !reg.unsure && !reg.paths.contains(&file.worktree) => {
+                                Some(Gone::Worktree)
+                            }
+                            _ => Some(Gone::Listed),
+                        }
+                    }
+                },
+            }
+        };
+        let touched = match file.comments.iter().map(|c| c.created.max(c.updated)).max() {
+            Some(t) => t,
+            // Unknown counts as now, so it never looks old.
+            None => std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or_else(|| now().0, |d| d.as_secs()),
+        };
+        found.push(Entry {
+            path,
+            worktree: file.worktree,
+            comments: file.comments.len(),
+            gone,
+            touched,
+        });
+    }
+    found.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+    Ok(found)
+}
+
+/// The worktrees git lists for the common dir `repo`, missing ones included; `None` when git
+/// can't tell.
+fn registered(repo: &Path) -> Option<Registered> {
+    let mut reg = Registered {
+        paths: HashSet::new(),
+        unsure: false,
+    };
+    for w in crate::git::list_worktrees_of(repo).ok()? {
+        match resolve(&w.path) {
+            Some(p) if p == repo => reg.unsure = true,
+            Some(p) => {
+                reg.paths.insert(p);
+            }
+            None => reg.unsure = true,
+        }
+        reg.paths.insert(w.path);
+    }
+    Some(reg)
+}
+
+/// The canonical form of `path`, or of its parent joined with its name when it's missing;
+/// `None` when neither can be resolved (e.g. on an unmounted volume).
+fn resolve(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().or_else(|| {
+        let (parent, name) = path.parent().zip(path.file_name())?;
+        Some(parent.canonicalize().ok()?.join(name))
+    })
 }
 
 pub fn now() -> (u64, u64) {
@@ -663,6 +822,175 @@ mod tests {
         let (removed, error) = prune_in(&dir.path().join("missing"), repo, &wts);
         assert_eq!(removed, 0);
         assert!(error.is_none());
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=T", "-c", "user.email=t@t"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn picks_stale_entries() {
+        let day = 86_400;
+        let entry = |gone, touched| Entry {
+            path: PathBuf::new(),
+            worktree: PathBuf::new(),
+            comments: 0,
+            gone,
+            touched,
+        };
+        let now = 100 * day;
+        let fresh = entry(None, now - day);
+        let old = entry(None, now - 30 * day);
+        let removed = entry(Some(Gone::Worktree), now);
+        let old_unknown = entry(Some(Gone::Unknown), now - 40 * day);
+        let listed = entry(Some(Gone::Listed), now - 40 * day);
+        assert_eq!(listed.stale(true, None, now), None);
+        assert_eq!(listed.stale(true, Some(40), now), Some(Stale::Idle(40)));
+        assert_eq!(Stale::Idle(1).to_string(), "untouched for 1 day");
+        assert_eq!(Stale::Idle(2).to_string(), "untouched for 2 days");
+        assert_eq!(fresh.stale(true, Some(2), now), None);
+        assert_eq!(fresh.stale(false, Some(1), now), Some(Stale::Idle(1)));
+        assert_eq!(old.stale(true, None, now), None);
+        assert_eq!(old.stale(false, Some(30), now), Some(Stale::Idle(30)));
+        assert_eq!(old.stale(false, Some(31), now), None);
+        assert_eq!(
+            removed.stale(false, None, now),
+            Some(Stale::Gone(Gone::Worktree))
+        );
+        // Age alone is enough, without `deleted_repos`.
+        assert_eq!(old_unknown.stale(false, None, now), None);
+        assert_eq!(
+            old_unknown.stale(false, Some(30), now),
+            Some(Stale::Idle(40))
+        );
+        assert_eq!(
+            old_unknown.stale(true, Some(30), now),
+            Some(Stale::Gone(Gone::Unknown))
+        );
+        // Touched in the future (clock skew) is fresh.
+        assert_eq!(entry(None, now + day).stale(false, Some(1), now), None);
+    }
+
+    #[test]
+    fn scans_comment_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let comments = root.join("comments");
+        std::fs::create_dir(&comments).unwrap();
+        let main = root.join("main");
+        git(&root, &["init", "-q", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        let repo = main.join(".git");
+        // Still registered but missing (e.g. on an unmounted volume); one with a relative path.
+        git(&main, &["worktree", "add", "-q", "../away"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
+                "-q",
+                "../rel",
+            ],
+        );
+        // Removed properly.
+        git(&main, &["worktree", "add", "-q", "../removed"]);
+        git(&main, &["worktree", "remove", "../removed"]);
+        // The main worktree's location isn't recorded in a separate git dir.
+        let sep = root.join("sep.git");
+        git(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                sep.to_str().unwrap(),
+                "sepwt",
+            ],
+        );
+        for wt in ["away", "rel", "sepwt"] {
+            std::fs::rename(root.join(wt), root.join(format!("{wt}-moved"))).unwrap();
+        }
+        // A worktree added through a symlink, on a volume that's then unmounted: neither it nor
+        // its parent resolves, so a removed worktree of the same repo can't be told apart.
+        let vol = root.join("vol");
+        std::fs::create_dir(&vol).unwrap();
+        std::os::unix::fs::symlink(&vol, root.join("link")).unwrap();
+        let other = root.join("other");
+        git(&root, &["init", "-q", "other"]);
+        git(&other, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&other, &["worktree", "add", "-q", "../link/sub/linked"]);
+        git(&other, &["worktree", "add", "-q", "../other-removed"]);
+        git(&other, &["worktree", "remove", "../other-removed"]);
+        std::fs::rename(&vol, root.join("vol-unmounted")).unwrap();
+        let put = |wt: &Path, repo: Option<&Path>| {
+            let mut json = serde_json::json!({
+                "version": 1,
+                "worktree": wt,
+                "comments": [comment(1, Side::New, 1, "x", None)],
+            });
+            if let Some(r) = repo {
+                json["repo"] = r.to_str().unwrap().into();
+            }
+            std::fs::write(comments.join(file_name(wt)), json.to_string()).unwrap();
+        };
+        put(&main, Some(&repo));
+        put(&root.join("away"), Some(&repo));
+        put(&root.join("rel"), Some(&repo));
+        put(&root.join("removed"), Some(&repo));
+        put(&root.join("sepwt"), Some(&sep));
+        put(&root.join("gone-repo"), Some(&root.join("gone/.git")));
+        put(&root.join("legacy"), None);
+        put(&root.join("vol/sub/linked"), Some(&other.join(".git")));
+        put(&root.join("other-removed"), Some(&other.join(".git")));
+        std::fs::write(comments.join("%broken.json"), "not json").unwrap();
+        std::fs::copy(
+            comments.join(file_name(&root.join("removed"))),
+            comments.join("renamed.json"),
+        )
+        .unwrap();
+
+        let found: Vec<_> = scan_in(&comments)
+            .unwrap()
+            .into_iter()
+            .map(|e| {
+                assert_eq!(e.path, comments.join(file_name(&e.worktree)));
+                assert_eq!((e.comments, e.touched), (1, 0));
+                (e.worktree.strip_prefix(&root).unwrap().to_owned(), e.gone)
+            })
+            .collect();
+        let p = PathBuf::from;
+        assert_eq!(
+            found,
+            vec![
+                (p("away"), Some(Gone::Listed)),
+                (p("gone-repo"), Some(Gone::Repo)),
+                (p("legacy"), Some(Gone::Unknown)),
+                (p("main"), None),
+                (p("other-removed"), Some(Gone::Listed)),
+                (p("rel"), Some(Gone::Listed)),
+                (p("removed"), Some(Gone::Worktree)),
+                (p("sepwt"), Some(Gone::Listed)),
+                (p("vol/sub/linked"), Some(Gone::Listed)),
+            ]
+        );
+        assert!(scan_in(&root.join("none")).unwrap().is_empty());
     }
 
     #[test]

@@ -155,6 +155,33 @@ pub fn list_worktrees(repo_dir: &Path) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&String::from_utf8_lossy(&out)))
 }
 
+/// Like [`list_worktrees`] for the git common dir `repo`, ignoring the repository environment
+/// (`GIT_DIR` etc., e.g. inherited from a hook) that would otherwise override it.
+pub fn list_worktrees_of(repo: &Path) -> Result<Vec<Worktree>> {
+    let mut cmd = command(repo);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("failed to run git (is it installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "git worktree: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_worktrees(&String::from_utf8_lossy(&out.stdout)))
+}
+
 pub fn parse_worktrees(s: &str) -> Vec<Worktree> {
     let mut result = Vec::new();
     let mut cur: Option<Worktree> = None;

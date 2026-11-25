@@ -17,7 +17,7 @@ commit history, side by side and updating in near-realtime.
   changes, and are marked by a bar in the gutter. They are stored as JSON per worktree in `$XDG_STATE_HOME/wtm`
   (default `~/.local/state/wtm`); the format is described by [`schema/comments.schema.json`](schema/comments.schema.json),
   a copy of which is written next to the files and linked from their `$schema`. Files of removed worktrees are
-  deleted on startup.
+  deleted on startup, unless one of the repository's worktrees is missing (e.g. on an unmounted volume).
 - **Comments pane** (`C`) on the right lists every comment of the worktree, working tree and commits alike.
   `Ctrl-n` / `Ctrl-p` (or a click on an entry) jump to a comment, switching to its commit, file and line.
   Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found
@@ -65,6 +65,22 @@ Run `wtm` anywhere inside a git repository or one of its worktrees:
 wtm
 wtm --theme dracula      # or: export WTM_THEME=dracula
 ```
+
+Comment files of removed worktrees are deleted when `wtm` starts in their repository, unless one of its
+worktrees is missing. To clean up all repositories at once, without starting the TUI:
+
+```sh
+wtm prune                    # list comment files whose worktrees were removed
+wtm prune --yes              # delete them
+wtm prune --deleted-repos    # also include repositories that no longer exist
+wtm prune --age 30           # also include files with no comment added or edited in 30 days
+```
+
+Worktrees git still lists are kept even when their directory is missing, e.g. on an unmounted volume; after deleting
+one without `git worktree remove`, run `git worktree prune` first.
+`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume, and also
+includes files from older versions of `wtm` that didn't record their repository. `--age` applies to every file,
+including those of existing worktrees.
 
 ## Keys
 
