@@ -72,8 +72,9 @@ wtm --theme dracula      # or: export WTM_THEME=dracula
 
 ### Comments from the command line
 
-`wtm comments` reads and closes the comments of the worktree it is run in, e.g. by an AI agent that has handled
-review comments:
+`wtm comments list`, `close` and `reopen` work on the comments of the worktree they are run in, e.g. for an AI agent
+that has handled review comments. (`wtm comments prune` is different: it covers all repositories, see
+[below](#cleaning-up-comment-files).)
 
 ```sh
 wtm comments list                     # open comments: id, file:line, commit, body
@@ -82,7 +83,7 @@ wtm comments close <ID>... --by NAME  # close fixed or dropped comments (--by de
 wtm comments reopen <ID>...
 ```
 
-It finds the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
+They find the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
 represent exactly, so `--json` prints them as strings. Editing a closed comment's text reopens it.
 
 ### Cleaning up comment files

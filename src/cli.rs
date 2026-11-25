@@ -10,14 +10,24 @@ use std::path::Path;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List, close or reopen the comments of the current worktree, or clean up stale comment
-    /// files.
+    /// List, close or reopen the comments of the current worktree; `prune` cleans up stale
+    /// comment files of all repositories.
     #[command(subcommand)]
     Comments(CommentsCmd),
 }
 
 #[derive(Subcommand)]
 pub enum CommentsCmd {
+    #[command(flatten)]
+    Worktree(WorktreeCmd),
+    /// List comment files of removed worktrees across all repositories, and delete them with
+    /// `--yes`. Doesn't need a repository.
+    Prune(PruneArgs),
+}
+
+/// Commands on the comments of the current worktree.
+#[derive(Subcommand)]
+pub enum WorktreeCmd {
     /// List open comments: id, file:line, commit (if any), then the indented body.
     List {
         /// Include closed comments.
@@ -41,9 +51,6 @@ pub enum CommentsCmd {
         #[arg(required = true, value_name = "ID")]
         ids: Vec<u64>,
     },
-    /// List comment files of removed worktrees across all repositories, and delete them with
-    /// `--yes`. Doesn't need a repository.
-    Prune(PruneArgs),
 }
 
 #[derive(Args)]
@@ -64,32 +71,35 @@ pub struct PruneArgs {
 
 pub fn run(cmd: Command) -> Result<()> {
     let Command::Comments(cmd) = cmd;
-    let mut out = std::io::stdout().lock();
-    if let CommentsCmd::Prune(args) = cmd {
-        let (dir, entries) = comments::scan()?;
-        let now = comments::now().0;
-        return prune(&dir, &entries, &args, now, &mut out, &mut std::io::stderr());
+    match cmd {
+        CommentsCmd::Worktree(cmd) => {
+            let repo = git::discover(&std::env::current_dir()?)?;
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let mut store = Store::load(&canon(&repo.toplevel), &canon(&repo.common_dir));
+            comments_cmd(cmd, &mut store, &mut std::io::stdout().lock())
+        }
+        CommentsCmd::Prune(args) => {
+            let (dir, entries) = comments::scan()?;
+            let now = comments::now().0;
+            let out = &mut std::io::stdout().lock();
+            prune(&dir, &entries, &args, now, out, &mut std::io::stderr())
+        }
     }
-    let repo = git::discover(&std::env::current_dir()?)?;
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let mut store = Store::load(&canon(&repo.toplevel), &canon(&repo.common_dir));
-    comments_cmd(cmd, &mut store, &mut out)
 }
 
-fn comments_cmd(cmd: CommentsCmd, store: &mut Store, out: &mut impl Write) -> Result<()> {
+fn comments_cmd(cmd: WorktreeCmd, store: &mut Store, out: &mut impl Write) -> Result<()> {
     if let Some(e) = &store.error {
         bail!("comments unreadable: {e}");
     }
     let (ids, closed) = match cmd {
-        CommentsCmd::List { all, json } => return list(store, all, json, out),
-        CommentsCmd::Close { ids, by } => {
+        WorktreeCmd::List { all, json } => return list(store, all, json, out),
+        WorktreeCmd::Close { ids, by } => {
             if by.trim().is_empty() {
                 bail!("--by must not be empty");
             }
             (ids, Some(by))
         }
-        CommentsCmd::Reopen { ids } => (ids, None),
-        CommentsCmd::Prune(_) => unreachable!("`run` handles prune, which needs no worktree"),
+        WorktreeCmd::Reopen { ids } => (ids, None),
     };
     let verb = if closed.is_some() {
         "Closed"
@@ -209,7 +219,8 @@ fn prune(
     let mut failed = 0;
     for (e, _) in &picked {
         if let Err(io) = std::fs::remove_file(&e.path) {
-            writeln!(err, "removing {}: {io}", e.path.display())?;
+            // Best effort: an unwritable stderr mustn't stop the remaining deletions.
+            let _ = writeln!(err, "removing {}: {io}", e.path.display());
             failed += 1;
         }
     }
@@ -248,14 +259,14 @@ mod tests {
         }
     }
 
-    fn run(store: &mut Store, cmd: CommentsCmd) -> (Result<()>, String) {
+    fn run(store: &mut Store, cmd: WorktreeCmd) -> (Result<()>, String) {
         let mut out = Vec::new();
         let res = comments_cmd(cmd, store, &mut out);
         (res, String::from_utf8(out).unwrap())
     }
 
-    fn list(all: bool, json: bool) -> CommentsCmd {
-        CommentsCmd::List { all, json }
+    fn list(all: bool, json: bool) -> WorktreeCmd {
+        WorktreeCmd::List { all, json }
     }
 
     #[test]
@@ -276,7 +287,7 @@ mod tests {
 
         let (res, out) = run(
             &mut s,
-            CommentsCmd::Close {
+            WorktreeCmd::Close {
                 ids: vec![2],
                 by: "claude".into(),
             },
@@ -301,12 +312,12 @@ mod tests {
         assert_eq!(json[1]["closed"]["by"], "claude");
 
         // Unknown ids fail, after the known ones were handled.
-        let (res, out) = run(&mut s, CommentsCmd::Reopen { ids: vec![2, 9] });
+        let (res, out) = run(&mut s, WorktreeCmd::Reopen { ids: vec![2, 9] });
         assert!(res.unwrap_err().to_string().contains('9'));
         assert_eq!(out, "Reopened 2\n");
         assert!(s.comments.iter().all(|c| c.closed.is_none()));
 
-        let blank = CommentsCmd::Close {
+        let blank = WorktreeCmd::Close {
             ids: vec![1],
             by: " ".into(),
         };
@@ -320,7 +331,7 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         let mut s = Store::load_from(Path::new("/wt"), Path::new("/r"), Some(path.clone()));
         assert!(run(&mut s, list(false, false)).0.is_err());
-        let close = CommentsCmd::Close {
+        let close = WorktreeCmd::Close {
             ids: vec![1],
             by: "a".into(),
         };
