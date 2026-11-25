@@ -1,10 +1,17 @@
 version: 2
+
+# Bundle all Cargo and GitHub Actions updates into a single weekly PR.
+multi-ecosystem-groups:
+  all-dependencies:
+    schedule:
+      interval: weekly
+
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: weekly
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies
