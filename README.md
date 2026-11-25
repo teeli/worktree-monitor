@@ -70,22 +70,6 @@ wtm
 wtm --theme dracula      # or: export WTM_THEME=dracula
 ```
 
-Comment files of removed worktrees are deleted when `wtm` starts in their repository, unless one of its
-worktrees is missing. To clean up all repositories at once, without starting the TUI:
-
-```sh
-wtm prune                    # list comment files whose worktrees were removed
-wtm prune --yes              # delete them
-wtm prune --deleted-repos    # also include repositories that no longer exist
-wtm prune --age 30           # also include files with no comment added or edited in 30 days
-```
-
-Worktrees git still lists are kept even when their directory is missing, e.g. on an unmounted volume; after deleting
-one without `git worktree remove`, run `git worktree prune` first.
-`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume, and also
-includes files from older versions of `wtm` that didn't record their repository. `--age` applies to every file,
-including those of existing worktrees.
-
 ### Comments from the command line
 
 `wtm comments` reads and closes the comments of the worktree it is run in, e.g. by an AI agent that has handled
@@ -100,6 +84,24 @@ wtm comments reopen <ID>...
 
 It finds the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
 represent exactly, so `--json` prints them as strings. Editing a closed comment's text reopens it.
+
+### Cleaning up comment files
+
+Comment files of removed worktrees are deleted when `wtm` starts in their repository, unless one of its
+worktrees is missing. To clean up all repositories at once, without starting the TUI:
+
+```sh
+wtm comments prune                    # list comment files whose worktrees were removed
+wtm comments prune --yes              # delete them
+wtm comments prune --deleted-repos    # also include repositories that no longer exist
+wtm comments prune --age 30           # also include files with no comment added or edited in 30 days
+```
+
+Worktrees git still lists are kept even when their directory is missing, e.g. on an unmounted volume; after deleting
+one without `git worktree remove`, run `git worktree prune` first.
+`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume, and also
+includes files from older versions of `wtm` that didn't record their repository. `--age` applies to every file,
+including those of existing worktrees.
 
 ## Keys
 

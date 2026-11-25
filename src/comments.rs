@@ -261,7 +261,7 @@ impl std::fmt::Display for Stale {
     }
 }
 
-/// A comment file, as seen by `wtm prune`.
+/// A comment file, as seen by `wtm comments prune`.
 #[derive(Debug)]
 pub struct Entry {
     pub path: PathBuf,
