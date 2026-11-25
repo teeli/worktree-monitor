@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -109,6 +109,10 @@ pub struct WtState {
     pub comments_reveal: bool,
     /// Comment to select in the diff once its commit, file and diff have loaded.
     pending_jump: Option<u64>,
+    /// Working tree comment → HEAD its commit was last searched up to.
+    resolve_tried: HashMap<u64, String>,
+    /// Working tree comments whose lines were found in no commit.
+    stale: HashSet<u64>,
 }
 
 impl WtState {
@@ -153,6 +157,8 @@ impl WtState {
             comments_offset: 0,
             comments_reveal: false,
             pending_jump: None,
+            resolve_tried: HashMap::new(),
+            stale: HashSet::new(),
         }
     }
 
@@ -223,6 +229,16 @@ impl WtState {
         comments::order(&self.comments.comments, |sha| {
             self.commits.iter().position(|c| c.sha == sha)
         })
+    }
+
+    /// Whether `c` is a working tree comment whose file is unchanged and whose lines were
+    /// committed nowhere (e.g. the changes were discarded).
+    pub fn is_stale(&self, c: &Comment) -> bool {
+        c.commit.is_none() && self.stale.contains(&c.id) && !self.changed(&c.file)
+    }
+
+    fn changed(&self, file: &str) -> bool {
+        self.changes.iter().any(|f| f.path == file)
     }
 
     fn select_comment(&mut self, id: Option<u64>) {
@@ -623,6 +639,7 @@ impl App {
                 self.refresh_log(self.active);
                 for i in 0..self.wts.len() {
                     self.refresh_conflicts(i);
+                    self.resolve_comments(i);
                 }
             }
             GitResult::Worktrees { res: Err(e), .. } => self.notify(format!("{e:#}"), true),
@@ -636,6 +653,8 @@ impl App {
                         st.error = None;
                         st.loaded = true;
                         st.changes = changes;
+                        self.resolve_comments(i);
+                        let st = &mut self.wts[i];
                         // Rows and diff catch up once the comment input closes.
                         if st.commit.is_none() && !editing {
                             let kept = st.rebuild_rows();
@@ -743,7 +762,64 @@ impl App {
                     Err(e) => st.diff_error = Some(format!("{e:#}")),
                 }
             }
+            GitResult::ResolveComments { wt, head, res } => {
+                let Some(i) = self.index_of(&wt) else { return };
+                let st = &mut self.wts[i];
+                if st.info.head.as_deref() != Some(head.as_str()) {
+                    return;
+                }
+                let mut moves = Vec::new();
+                for (id, sha) in res {
+                    match sha {
+                        Some(sha) => moves.push((id, sha)),
+                        None => {
+                            st.stale.insert(id);
+                        }
+                    }
+                }
+                if moves.is_empty() {
+                    return;
+                }
+                let res = st.comments.move_to_commits(&moves);
+                st.reanchor();
+                match res {
+                    Ok(()) => {
+                        let n = moves.len();
+                        let s = if n == 1 { "" } else { "s" };
+                        self.notify(
+                            format!("Moved {n} comment{s} to the commit{s} of their lines"),
+                            false,
+                        );
+                    }
+                    Err(e) => self.notify(format!("Moving comments failed: {e:#}"), true),
+                }
+            }
         }
+    }
+
+    /// Looks for the commits of working tree comments whose file has no uncommitted changes
+    /// any more, once per HEAD.
+    fn resolve_comments(&mut self, i: usize) {
+        let st = &mut self.wts[i];
+        let Some(head) = st.info.head.clone().filter(|_| st.loaded) else {
+            return;
+        };
+        let comments: Vec<Comment> = st
+            .comments
+            .comments
+            .iter()
+            .filter(|c| c.commit.is_none() && !st.changed(&c.file))
+            .filter(|c| st.resolve_tried.get(&c.id) != Some(&head))
+            .cloned()
+            .collect();
+        if comments.is_empty() {
+            return;
+        }
+        for c in &comments {
+            st.resolve_tried.insert(c.id, head.clone());
+        }
+        let wt = st.info.path.clone();
+        self.send(Job::ResolveComments { wt, head, comments });
     }
 
     /// Whether a comment input is open for worktree `wt`.
@@ -1360,8 +1436,14 @@ impl App {
         }
         let path = c.file.clone();
         if !st.files().iter().any(|f| f.path == path) {
+            let msg = if st.is_stale(c) {
+                "Comment is stale: its lines are neither in the working tree nor in a commit"
+                    .to_string()
+            } else {
+                format!("{path} has no changes here")
+            };
             st.pending_jump = None;
-            self.notify(format!("{path} has no changes here"), true);
+            self.notify(msg, true);
             return;
         }
         st.reveal(&path);

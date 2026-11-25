@@ -190,6 +190,40 @@ impl Store {
     pub fn remove(&mut self, id: u64) -> Result<()> {
         self.modify(|all| all.retain(|c| c.id != id))
     }
+
+    /// Moves working tree comments to the commits their lines were committed in.
+    pub fn move_to_commits(&mut self, moves: &[(u64, String)]) -> Result<()> {
+        self.modify(|all| {
+            for c in all.iter_mut().filter(|c| c.commit.is_none()) {
+                if let Some((_, sha)) = moves.iter().find(|(id, _)| *id == c.id) {
+                    c.commit = Some(sha.clone());
+                }
+            }
+        })
+    }
+}
+
+/// The commit (oldest first in `history`) a working tree comment's line was most likely
+/// committed in: the first one changing a line with its text on its side, else the first one
+/// showing such a line at all (comments on context lines).
+pub fn resolve_commit<'a>(c: &Comment, history: &'a [(String, Diff)]) -> Option<&'a str> {
+    let changed = match c.side {
+        Side::New => LineKind::Add,
+        Side::Old => LineKind::Del,
+    };
+    let has = |diff: &Diff, kinds: &[LineKind]| {
+        (0..diff.lines.len()).any(|i| {
+            let l = &diff.lines[i];
+            kinds.contains(&l.kind) && l.text == c.line_text && line_no(diff, i, c.side).is_some()
+        })
+    };
+    let pick = |kinds: &[LineKind]| {
+        history
+            .iter()
+            .find(|(_, d)| has(d, kinds))
+            .map(|(sha, _)| sha.as_str())
+    };
+    pick(&[changed]).or_else(|| pick(&[changed, LineKind::Context]))
 }
 
 /// Where the comments of one diff are shown.
@@ -408,7 +442,13 @@ mod tests {
         assert_eq!(s2.comments.len(), 2);
         assert_eq!(s2.comments[1], c);
         s.remove(1).unwrap();
-        assert_eq!(Store::load_from(wt, Some(path.clone())).comments, vec![c]);
+        assert_eq!(
+            Store::load_from(wt, Some(path.clone())).comments,
+            vec![c.clone()]
+        );
+        // Only working tree comments move.
+        s.move_to_commits(&[(2, "def".into())]).unwrap();
+        assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
 
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, Some(path.clone()));
@@ -435,6 +475,36 @@ mod tests {
         let o = order(&cs, |sha| log.iter().position(|s| *s == sha));
         let ids: Vec<u64> = o.into_iter().map(|i| cs[i].id).collect();
         assert_eq!(ids, vec![6, 3, 4, 7, 1, 5, 2]);
+    }
+
+    #[test]
+    fn resolves_committed_comments() {
+        let h = |sha: &str, raw: &str| (sha.to_string(), diff::parse(raw));
+        let history = vec![
+            h("a", "@@ -1,2 +1,2 @@\n x\n-y\n+z\n"),
+            h("b", "@@ -1,2 +1,3 @@\n x\n z\n+w\n"),
+        ];
+        assert_eq!(
+            resolve_commit(&comment(1, Side::New, 2, "z", None), &history),
+            Some("a")
+        );
+        assert_eq!(
+            resolve_commit(&comment(2, Side::Old, 2, "y", None), &history),
+            Some("a")
+        );
+        assert_eq!(
+            resolve_commit(&comment(3, Side::New, 3, "w", None), &history),
+            Some("b")
+        );
+        // Only ever context: the first commit showing it.
+        assert_eq!(
+            resolve_commit(&comment(4, Side::New, 1, "x", None), &history),
+            Some("a")
+        );
+        assert_eq!(
+            resolve_commit(&comment(5, Side::New, 1, "gone", None), &history),
+            None
+        );
     }
 
     #[test]

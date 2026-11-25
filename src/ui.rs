@@ -763,6 +763,7 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
             _ => format!(":{}", c.line),
         };
         let (tag, tag_style) = match &c.commit {
+            None if st.is_stale(c) => (" · stale".to_string(), theme.error),
             None => (String::new(), theme.dim),
             Some(sha) => match st.commits.iter().find(|x| &x.sha == sha) {
                 Some(commit) => (format!(" @ {}", commit.short), theme.sha),

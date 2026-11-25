@@ -510,9 +510,47 @@ pub fn commit_diff(wt: &Path, commit: &Commit, file: &FileChange) -> Result<Stri
     Ok(cap(run_ok(wt, &args)?))
 }
 
+/// Commits in `since..HEAD` touching `file`, oldest first, each with its patch for `file`.
+pub fn file_history(wt: &Path, since: &str, file: &str) -> Result<Vec<(String, String)>> {
+    let range = format!("{since}..HEAD");
+    let out = run_ok(
+        wt,
+        &[
+            "log",
+            "--reverse",
+            "--no-ext-diff",
+            "-p",
+            "--format=%x1e%H",
+            &range,
+            "--",
+            file,
+        ],
+    )?;
+    Ok(parse_history(&String::from_utf8_lossy(&out)))
+}
+
+fn parse_history(s: &str) -> Vec<(String, String)> {
+    s.split('\x1e')
+        .filter_map(|r| {
+            let (sha, patch) = r.split_once('\n').unwrap_or((r, ""));
+            let sha = sha.trim();
+            (!sha.is_empty()).then(|| (sha.to_string(), patch.to_string()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_history() {
+        let h = parse_history("\x1eaaa\n\ndiff --git a/f b/f\n+x\n\x1ebbb\n");
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].0, "aaa");
+        assert!(h[0].1.contains("+x"));
+        assert_eq!(h[1], ("bbb".to_string(), String::new()));
+    }
 
     #[test]
     fn parses_worktree_porcelain() {
