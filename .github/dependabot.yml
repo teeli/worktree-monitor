@@ -1,17 +1,20 @@
 version: 2
 
-# Bundle all Cargo and GitHub Actions updates into a single weekly PR.
-multi-ecosystem-groups:
-  all-dependencies:
-    schedule:
-      interval: weekly
-
+# Minor and patch updates are bundled into one weekly PR per ecosystem. Semver-major updates
+# match no group, so each gets its own PR (they usually need code changes).
+# Multi-ecosystem groups don't document update-type filtering, hence per-ecosystem groups.
 updates:
   - package-ecosystem: github-actions
     directory: /
-    patterns: ["*"]
-    multi-ecosystem-group: all-dependencies
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        update-types: [minor, patch]
   - package-ecosystem: cargo
     directory: /
-    patterns: ["*"]
-    multi-ecosystem-group: all-dependencies
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
