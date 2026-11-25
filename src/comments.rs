@@ -134,10 +134,32 @@ fn write(path: &Path, mut file: CommentFile) -> Result<CommentFile> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     // The schema lives in the state directory, one level above the comment files.
     file.schema = Some(write_schema(dir.parent().unwrap_or(dir))?);
-    let tmp = path.with_extension("json.tmp");
+    // Per process, so concurrent writers (the TUI, `wtm comments`) don't share a temp file.
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(file)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("json.{}.tmp", std::process::id()))
+}
+
+/// Exclusive lock on the comments directory `dir` (created if missing), held until the file is
+/// dropped. Serializes read-modify-write cycles of the TUI and `wtm comments` across processes.
+/// Not reentrant: a process must not take it twice.
+fn lock(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(".lock");
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
     Ok(file)
 }
 
@@ -152,6 +174,12 @@ pub fn prune(repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
 }
 
 fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
+    // Tagging rewrites files, so keep `Store::modify` out meanwhile; a missing directory has
+    // nothing to prune and isn't created.
+    let _lock = match dir.exists().then(|| lock(dir)).transpose() {
+        Ok(l) => l,
+        Err(e) => return (0, Some(e)),
+    };
     let files = match comment_files(dir) {
         Ok(f) => f,
         Err(e) => return (0, Some(e)),
@@ -372,8 +400,6 @@ pub struct Store {
     pub comments: Vec<Comment>,
     /// Why the file could not be read; it is never overwritten while this is set.
     pub error: Option<String>,
-    /// Modification time of the file when last read or written, to notice other writers.
-    mtime: Option<SystemTime>,
 }
 
 impl Store {
@@ -389,9 +415,7 @@ impl Store {
             path,
             comments: Vec::new(),
             error: None,
-            mtime: None,
         };
-        store.mtime = store.file_mtime();
         match store.read() {
             Ok(c) => store.comments = c,
             Err(e) => store.error = Some(format!("{e:#}")),
@@ -399,19 +423,10 @@ impl Store {
         store
     }
 
-    fn file_mtime(&self) -> Option<SystemTime> {
-        let path = self.path.as_ref()?;
-        std::fs::metadata(path).and_then(|m| m.modified()).ok()
-    }
-
-    /// Re-reads the file if something else (another instance, `wtm comments close`) wrote it
-    /// since. Returns whether the comments changed.
+    /// Re-reads the file to pick up other writers (another instance, `wtm comments close`).
+    /// The files are small, so this reads unconditionally rather than trusting mtimes, which
+    /// can be too coarse to tell writes apart. Returns whether the comments changed.
     pub fn reload_if_changed(&mut self) -> bool {
-        let mtime = self.file_mtime();
-        if mtime == self.mtime {
-            return false;
-        }
-        self.mtime = mtime;
         let (comments, error) = match self.read() {
             Ok(c) => (c, None),
             Err(e) => (self.comments.clone(), Some(format!("{e:#}"))),
@@ -441,6 +456,7 @@ impl Store {
             .path
             .clone()
             .ok_or_else(|| anyhow!("no state directory (set XDG_STATE_HOME or HOME)"))?;
+        let _lock = lock(path.parent().unwrap_or(Path::new(".")))?;
         let mut comments = self
             .read()
             .inspect_err(|e| self.error = Some(format!("{e:#}")))?;
@@ -454,7 +470,6 @@ impl Store {
             comments,
         };
         self.comments = write(&path, file)?.comments;
-        self.mtime = self.file_mtime();
         Ok(())
     }
 
@@ -558,9 +573,11 @@ impl Anchors {
     /// The comment (index into `Store::comments`) of a range shown further down that covers
     /// diff line `i`.
     pub fn covering(&self, i: usize) -> Option<usize> {
+        // Of overlapping ranges, the one ending nearest below `i`, whose box is closest.
         self.by_line
             .iter()
-            .find(|&(&end, a)| a.start <= i && i < end)
+            .filter(|&(&end, a)| a.start <= i && i < end)
+            .min_by_key(|&(&end, _)| end)
             .map(|(_, a)| a.comment)
     }
 
@@ -822,19 +839,44 @@ mod tests {
         mine.upsert(comment(1, Side::New, 1, "a", None)).unwrap();
         // Our own write is not a change.
         assert!(!mine.reload_if_changed());
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut other = Store::load_from(wt, repo, Some(path.clone()));
         other.set_closed(1, Some(Closed::now("agent"))).unwrap();
-        // Make sure the mtime differs even on coarse-grained file systems.
-        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        // Seen even when the mtime doesn't change (coarse-grained file systems).
         std::fs::File::options()
             .write(true)
             .open(&path)
             .unwrap()
-            .set_modified(later)
+            .set_modified(mtime)
             .unwrap();
         assert!(mine.reload_if_changed());
         assert!(mine.comments[0].closed.is_some());
         assert!(!mine.reload_if_changed());
+    }
+
+    /// Concurrent writers (each with its own lock handle, like separate processes) don't lose
+    /// each other's changes.
+    #[test]
+    fn concurrent_writers_keep_all_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let writers: Vec<_> = (0..4u64)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut s = Store::load_from(Path::new("/wt"), Path::new("/r"), Some(path));
+                    for k in 0..25 {
+                        s.upsert(comment(w * 100 + k, Side::New, 1, "a", None))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let s = Store::load_from(Path::new("/wt"), Path::new("/r"), Some(path));
+        assert_eq!(s.comments.len(), 100);
     }
 
     #[test]
@@ -1133,7 +1175,7 @@ mod tests {
         };
         // Tagging this one fails: its temp file path is taken by a directory.
         let stuck = put("/live", None);
-        std::fs::create_dir(stuck.with_extension("json.tmp")).unwrap();
+        std::fs::create_dir(tmp_path(&stuck)).unwrap();
         let dead = put("/dead", Some("/repo/.git"));
         let (removed, error) = prune_in(dir.path(), Path::new("/repo/.git"), &[Path::new("/live")]);
         assert_eq!(removed, 1);
@@ -1221,5 +1263,15 @@ mod tests {
         assert_eq!(a.covering(1), None);
         assert_eq!(a.covering(2), Some(0));
         assert_eq!(a.covering(3), None);
+
+        // Overlapping ranges: the one ending nearest below wins, regardless of map order.
+        let mut a = Anchors::default();
+        for (end, comment, start) in [(9, 0, 1), (6, 1, 3), (7, 2, 4)] {
+            a.by_line.insert(end, Anchor { comment, start });
+        }
+        assert_eq!(a.covering(2), Some(0));
+        assert_eq!(a.covering(4), Some(1));
+        assert_eq!(a.covering(6), Some(2));
+        assert_eq!(a.covering(8), Some(0));
     }
 }

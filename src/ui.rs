@@ -715,8 +715,13 @@ fn entry_rows(c: &Comment, width: usize) -> usize {
 }
 
 /// Id of the comment drawn at screen row `rel` of the comments pane.
-pub fn comment_at_row(st: &WtState, rel: usize, inner_width: u16) -> Option<u64> {
-    let order = st.comment_order();
+pub fn comment_at_row(
+    st: &WtState,
+    show_closed: bool,
+    rel: usize,
+    inner_width: u16,
+) -> Option<u64> {
+    let order = st.comment_order(show_closed);
     let all = &st.comments.comments;
     let i = row_to_line(st.comments_offset, order.len(), rel, |i| {
         entry_rows(&all[order[i]], inner_width as usize)
@@ -729,7 +734,7 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(st) = app.wts.get_mut(app.active) else {
         return;
     };
-    let order = st.comment_order();
+    let order = st.comment_order(app.show_closed);
     let block = pane_block(format!(" Comments · {} ", order.len()), &theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -740,7 +745,7 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
         return message(f, inner, err, theme.error);
     }
     if order.is_empty() {
-        let text = if st.comments.comments.is_empty() || st.show_closed {
+        let text = if st.comments.comments.is_empty() || app.show_closed {
             "No comments. Press c on a diff line to add one."
         } else {
             "No open comments. X shows closed ones."
