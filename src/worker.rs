@@ -2,6 +2,8 @@
 //! Queued jobs are coalesced: repeated refreshes of the same thing collapse into one.
 
 use crate::app::AppEvent;
+use crate::comments::{self, Comment};
+use crate::diff;
 use crate::git::{self, Base, Commit, Conflict, FileChange, Worktree};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -37,6 +39,13 @@ pub enum Job {
         commit: Option<Commit>,
         file: FileChange,
     },
+    /// Finds the commits working tree comments on now unchanged files were committed in.
+    ResolveComments {
+        wt: PathBuf,
+        /// HEAD the search runs up to; echoed back to discard stale results.
+        head: String,
+        comments: Vec<Comment>,
+    },
 }
 
 pub type ConflictKey = (String, String);
@@ -49,6 +58,7 @@ enum JobKey {
     Conflicts(PathBuf),
     CommitFiles,
     Diff,
+    ResolveComments(PathBuf),
 }
 
 impl Job {
@@ -61,6 +71,7 @@ impl Job {
             // Only the latest file list / diff request matters.
             Job::CommitFiles { .. } => JobKey::CommitFiles,
             Job::Diff { .. } => JobKey::Diff,
+            Job::ResolveComments { wt, .. } => JobKey::ResolveComments(wt.clone()),
         }
     }
 }
@@ -95,6 +106,21 @@ pub enum GitResult {
         id: u64,
         res: Result<String>,
     },
+    ResolveComments {
+        wt: PathBuf,
+        head: String,
+        res: Vec<(u64, Resolved)>,
+    },
+}
+
+/// Where a committed working tree comment's lines went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    Commit(String),
+    /// In no commit since the comment was written: the changes were discarded.
+    Nowhere,
+    /// The history could not be read (e.g. the comment's HEAD no longer exists).
+    Unknown,
 }
 
 pub fn spawn(repo_dir: PathBuf, events: Sender<AppEvent>) -> Sender<Job> {
@@ -174,7 +200,42 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
             };
             GitResult::Diff { wt, id, res }
         }
+        Job::ResolveComments { wt, head, comments } => {
+            let res = resolve_comments(&wt, &comments);
+            GitResult::ResolveComments { wt, head, res }
+        }
     }
+}
+
+fn resolve_comments(wt: &std::path::Path, comments: &[Comment]) -> Vec<(u64, Resolved)> {
+    // One history per (HEAD when written, file); `None` when it can't be read.
+    let mut histories = std::collections::HashMap::new();
+    comments
+        .iter()
+        .map(|c| {
+            let Some(head) = &c.head else {
+                return (c.id, Resolved::Unknown);
+            };
+            let history = histories
+                .entry((head.clone(), c.file.clone()))
+                .or_insert_with(|| {
+                    let h = git::file_history(wt, head, &c.file).ok()?;
+                    Some(
+                        h.into_iter()
+                            .map(|(sha, raw)| (sha, diff::parse(&raw)))
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            let res = match history {
+                None => Resolved::Unknown,
+                Some(h) => match comments::resolve_commit(c, h) {
+                    Some(sha) => Resolved::Commit(sha.to_string()),
+                    None => Resolved::Nowhere,
+                },
+            };
+            (c.id, res)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
 use crate::app::{App, CommentInput, WtState};
+use crate::comments::Comment;
 use crate::diff::{Diff, LineKind};
 use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
 use crate::theme::Theme;
@@ -21,6 +22,9 @@ const TREE_MID_WIDTH: u16 = 30;
 const TREE_MAX_WIDTH: u16 = 50;
 const MID_BREAKPOINT: u16 = 100;
 const WIDE_BREAKPOINT: u16 = 120;
+const COMMENTS_MIN_WIDTH: u16 = 24;
+/// The comments pane is hidden when the diff would get narrower than this.
+const DIFF_MIN_WIDTH: u16 = 40;
 
 /// The file panel is pinned to a fixed width on narrow and medium terminals, with the diff taking
 /// the rest. From `WIDE_BREAKPOINT` on the file panel takes a quarter of the width, capped at `TREE_MAX_WIDTH`.
@@ -35,6 +39,14 @@ fn panel_constraints(width: u16) -> [Constraint; 2] {
             Constraint::Min(0),
         ]
     }
+}
+
+/// Width of the comments pane next to the tree in a `width` wide window, if it fits: like the
+/// tree a quarter of the width, within `COMMENTS_MIN_WIDTH..=TREE_MAX_WIDTH`.
+fn comments_width(width: u16) -> Option<u16> {
+    let [_, rest] = Layout::horizontal(panel_constraints(width)).areas(Rect::new(0, 0, width, 1));
+    let w = (width / 4).clamp(COMMENTS_MIN_WIDTH, TREE_MAX_WIDTH);
+    (rest.width >= w + DIFF_MIN_WIDTH).then_some(w)
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -57,11 +69,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    let [tree, diff] = Layout::horizontal(panel_constraints(main.width)).areas(main);
+    let [tree, mut diff] = Layout::horizontal(panel_constraints(main.width)).areas(main);
+    let mut comments = None;
+    if let Some(w) = comments_width(main.width).filter(|_| app.comments_pane) {
+        let [d, c] = Layout::horizontal([Constraint::Min(0), Constraint::Length(w)]).areas(diff);
+        (diff, comments) = (d, Some(c));
+    }
 
     draw_tabs(f, app, tabs);
     draw_tree(f, app, tree);
     draw_diff(f, app, diff);
+    if let Some(area) = comments {
+        draw_comments(f, app, area);
+    }
     draw_commits(f, app, commits);
     draw_status(f, app, status);
     if app.help {
@@ -666,6 +686,141 @@ fn row_to_line(offset: usize, len: usize, rel: usize, rows: impl Fn(usize) -> us
     len
 }
 
+/// Screen rows of a comments pane entry `width` columns wide: header, body, blank separator.
+fn entry_rows(c: &Comment, width: usize) -> usize {
+    wrap_ranges(&c.body, width.saturating_sub(2)).len() + 2
+}
+
+/// Id of the comment drawn at screen row `rel` of the comments pane.
+pub fn comment_at_row(st: &WtState, rel: usize, inner_width: u16) -> Option<u64> {
+    let order = st.comment_order();
+    let all = &st.comments.comments;
+    let i = row_to_line(st.comments_offset, order.len(), rel, |i| {
+        entry_rows(&all[order[i]], inner_width as usize)
+    });
+    order.get(i).map(|&ci| all[ci].id)
+}
+
+fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = app.theme.clone();
+    let Some(st) = app.wts.get_mut(app.active) else {
+        return;
+    };
+    let order = st.comment_order();
+    let block = pane_block(format!(" Comments · {} ", order.len()), &theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hit.comments = inner;
+    let st = &mut app.wts[app.active];
+
+    if let Some(err) = &st.comments.error {
+        return message(f, inner, err, theme.error);
+    }
+    if order.is_empty() {
+        return message(
+            f,
+            inner,
+            "No comments. Press c on a diff line to add one.",
+            theme.dim,
+        );
+    }
+    let h = inner.height as usize;
+    let w = inner.width as usize;
+    let all = &st.comments.comments;
+    let heights: Vec<usize> = order.iter().map(|&ci| entry_rows(&all[ci], w)).collect();
+    let len = order.len();
+    // Don't scroll past the point where the last entry reaches the bottom.
+    let (mut max, mut total) = (len, 0);
+    while max > 0 && total < h {
+        max -= 1;
+        total += heights[max];
+    }
+    // The entry that overflowed doesn't fit; start after it unless it is the last one.
+    if total > h && max + 1 < len {
+        max += 1;
+    }
+    let mut off = st.comments_offset.min(max);
+    let sel = st
+        .comment_sel
+        .and_then(|id| order.iter().position(|&ci| all[ci].id == id));
+    if let Some(sel) = sel.filter(|_| std::mem::take(&mut st.comments_reveal)) {
+        // Scroll so the whole selected entry fits if it can.
+        off = off.min(sel);
+        let mut total: usize = heights[off..=sel].iter().sum();
+        while total > h && off < sel {
+            total -= heights[off];
+            off += 1;
+        }
+    }
+    st.comments_offset = off;
+    let st = &*st;
+    let all = &st.comments.comments;
+
+    let mut out: Vec<Line> = Vec::with_capacity(h);
+    for (i, &ci) in order.iter().enumerate().skip(off) {
+        if out.len() >= h {
+            break;
+        }
+        let c = &all[ci];
+        let lines = match &c.start {
+            Some(s) if s.line != c.line => format!(":{}-{}", s.line, c.line),
+            _ => format!(":{}", c.line),
+        };
+        let (tag, tag_style) = match &c.commit {
+            None if st.is_stale(c) => (" · stale".to_string(), theme.error),
+            None => (String::new(), theme.dim),
+            Some(sha) => match st.commits.iter().find(|x| &x.sha == sha) {
+                Some(commit) => (format!(" @ {}", commit.short), theme.sha),
+                None => {
+                    let short = sha.get(..7).unwrap_or(sha);
+                    (format!(" @ {short} · not in history"), theme.error)
+                }
+            },
+        };
+        let budget = w.saturating_sub(lines.width() + tag.width()).max(8);
+        let header = vec![
+            Span::styled(shorten_left(&c.file, budget), theme.base),
+            Span::styled(lines, theme.dim),
+            Span::styled(tag, tag_style),
+        ];
+        let mut rows = vec![fit_spans(header, w)];
+        for text in wrap_ranges(&c.body, w.saturating_sub(2)) {
+            let spans = vec![
+                Span::styled("│ ", theme.comment),
+                Span::styled(text.to_string(), theme.comment_text),
+            ];
+            rows.push(fit_spans(spans, w));
+        }
+        let selected = sel == Some(i);
+        for spans in rows {
+            out.push(if selected {
+                patch_row(spans, theme.diff_sel)
+            } else {
+                Line::from(spans)
+            });
+        }
+        out.push(Line::raw(""));
+    }
+    out.truncate(h);
+    f.render_widget(Paragraph::new(out), inner);
+
+    if max > 0 {
+        let mut state = ScrollbarState::new(max.max(off)).position(off);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(theme.dim);
+        f.render_stateful_widget(
+            bar,
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut state,
+        );
+    }
+}
+
 fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme.clone();
     let Some(st) = app.wts.get_mut(app.active) else {
@@ -812,13 +967,14 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let all = [
         Section::General,
         Section::Worktrees,
+        Section::Comments,
         Section::Diff,
         Section::Tree,
     ];
     let width_of = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let (gl, rest) = (
-        help_lines(&all[..2], theme, false),
-        help_lines(&all[2..], theme, true),
+        help_lines(&all[..3], theme, false),
+        help_lines(&all[3..], theme, true),
     );
     // Two columns when they fit side by side, otherwise one scrollable column.
     let cols = if width_of(&gl) + width_of(&rest) + 7 <= area.width {
@@ -890,6 +1046,22 @@ mod tests {
             assert_eq!(tree + diff, w);
             assert!(tree >= prev, "tree shrank at width {w}");
             prev = tree;
+        }
+    }
+
+    #[test]
+    fn comments_pane_fits_or_hides() {
+        assert_eq!(comments_width(80), None);
+        assert_eq!(comments_width(100), Some(25));
+        assert_eq!(comments_width(120), Some(30));
+        assert_eq!(comments_width(300), Some(50));
+        for w in MIN_WIDTH..=400 {
+            if let Some(c) = comments_width(w) {
+                let [tree, rest] =
+                    Layout::horizontal(panel_constraints(w)).areas(Rect::new(0, 0, w, 1));
+                assert!(rest.width - c >= DIFF_MIN_WIDTH, "diff too narrow at {w}");
+                assert!(tree.width + rest.width == w);
+            }
         }
     }
 

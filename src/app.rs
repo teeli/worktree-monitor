@@ -9,14 +9,14 @@ use crate::keymap::{self, Action, Lookup};
 use crate::theme::Theme;
 use crate::tree::{self, Row, RowKind};
 use crate::watcher::{self, FsWatcher};
-use crate::worker::{ConflictKey, GitResult, Job};
+use crate::worker::{ConflictKey, GitResult, Job, Resolved};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,7 @@ pub enum Pane {
     Tree,
     Diff,
     Commits,
+    Comments,
 }
 
 /// Everything shown for one worktree; kept per worktree so switching tabs restores it.
@@ -100,6 +101,20 @@ pub struct WtState {
     pub comments: Store,
     /// Where the comments for the shown diff sit.
     pub anchors: Anchors,
+    /// Comment highlighted in the comments pane; comment navigation continues from it.
+    pub comment_sel: Option<u64>,
+    /// First comment pane entry shown.
+    pub comments_offset: usize,
+    /// Scroll the comments pane to `comment_sel` on the next render.
+    pub comments_reveal: bool,
+    /// Comment to select in the diff once its commit, file and diff have loaded.
+    pending_jump: Option<u64>,
+    /// Working tree comment → HEAD its commit was last searched up to.
+    resolved: HashMap<u64, String>,
+    /// HEAD and comments of the last search requested, to not repeat it while it runs.
+    resolve_sent: Option<(String, Vec<u64>)>,
+    /// Working tree comments whose lines were found in no commit.
+    stale: HashSet<u64>,
 }
 
 impl WtState {
@@ -140,6 +155,13 @@ impl WtState {
             diff_anchor: None,
             comments,
             anchors: Anchors::default(),
+            comment_sel: None,
+            comments_offset: 0,
+            comments_reveal: false,
+            pending_jump: None,
+            resolved: HashMap::new(),
+            resolve_sent: None,
+            stale: HashSet::new(),
         }
     }
 
@@ -205,6 +227,76 @@ impl WtState {
         };
     }
 
+    /// Indices into `comments.comments` in pane and navigation order.
+    pub fn comment_order(&self) -> Vec<usize> {
+        comments::order(&self.comments.comments, |sha| {
+            self.commits.iter().position(|c| c.sha == sha)
+        })
+    }
+
+    /// Whether `c` is a working tree comment whose file is unchanged and whose lines were
+    /// committed nowhere (e.g. the changes were discarded).
+    pub fn is_stale(&self, c: &Comment) -> bool {
+        c.commit.is_none() && self.stale.contains(&c.id) && !self.changed(&c.file)
+    }
+
+    fn changed(&self, file: &str) -> bool {
+        self.changes.iter().any(|f| f.path == file)
+    }
+
+    fn select_comment(&mut self, id: Option<u64>) {
+        self.comment_sel = id;
+        self.comments_reveal = true;
+    }
+
+    /// Highlights the comment on the selected diff line, if there is one.
+    fn follow_selection(&mut self) {
+        let shown = self.diff_sel.and_then(|s| self.anchors.by_line.get(&s));
+        if let Some(c) = shown.and_then(|a| self.comments.comments.get(a.comment)) {
+            self.select_comment(Some(c.id));
+        }
+    }
+
+    /// Expands the directories containing `path`.
+    fn reveal(&mut self, path: &str) {
+        let before = self.collapsed.len();
+        self.collapsed
+            .retain(|d| !path.starts_with(&format!("{d}/")));
+        if self.collapsed.len() != before {
+            self.rebuild_rows();
+        }
+    }
+
+    /// Selects the line of the pending jump once its diff is shown. Returns a message when
+    /// the comment can't be placed.
+    fn apply_jump(&mut self, height: usize) -> Option<&'static str> {
+        let id = self.pending_jump?;
+        let Some(c) = self.comments.comments.iter().find(|c| c.id == id) else {
+            self.pending_jump = None;
+            return None;
+        };
+        let shown = self.file.as_ref().is_some_and(|f| f.path == c.file)
+            && c.commit.as_deref() == self.commit.as_ref().map(|c| c.sha.as_str());
+        if !shown || self.diff_raw.is_none() {
+            return None;
+        }
+        self.pending_jump = None;
+        let comments = &self.comments.comments;
+        let end = self
+            .anchors
+            .by_line
+            .iter()
+            .find(|(_, a)| comments.get(a.comment).is_some_and(|c| c.id == id))
+            .map(|(&end, _)| end);
+        let Some(end) = end else {
+            return Some("Comment is outdated: its line changed");
+        };
+        self.diff_sel = Some(end);
+        self.diff_anchor = None;
+        self.diff_offset = end.saturating_sub(height / 3);
+        None
+    }
+
     /// Selected diff lines, from the selection anchor (if any) to the cursor.
     pub fn sel_range(&self) -> Option<RangeInclusive<usize>> {
         let sel = self.diff_sel?;
@@ -255,6 +347,7 @@ pub struct HitAreas {
     pub tree: Rect,
     pub diff: Rect,
     pub commits: Rect,
+    pub comments: Rect,
 }
 
 pub struct App {
@@ -265,6 +358,8 @@ pub struct App {
     pub help: bool,
     /// Soft-wrap long diff lines instead of truncating them.
     pub wrap: bool,
+    /// Show the comments pane (when the terminal is wide enough).
+    pub comments_pane: bool,
     pub help_scroll: usize,
     pub toast: Option<(String, bool, Instant)>,
     pub hit: HitAreas,
@@ -304,6 +399,7 @@ impl App {
             active,
             help: false,
             wrap: false,
+            comments_pane: false,
             help_scroll: 0,
             toast: None,
             hit: HitAreas::default(),
@@ -546,6 +642,7 @@ impl App {
                 self.refresh_log(self.active);
                 for i in 0..self.wts.len() {
                     self.refresh_conflicts(i);
+                    self.resolve_comments(i);
                 }
             }
             GitResult::Worktrees { res: Err(e), .. } => self.notify(format!("{e:#}"), true),
@@ -559,6 +656,8 @@ impl App {
                         st.error = None;
                         st.loaded = true;
                         st.changes = changes;
+                        self.resolve_comments(i);
+                        let st = &mut self.wts[i];
                         // Rows and diff catch up once the comment input closes.
                         if st.commit.is_none() && !editing {
                             let kept = st.rebuild_rows();
@@ -634,12 +733,14 @@ impl App {
                         st.rebuild_rows();
                         self.sync_selection(i, false);
                         self.request_diff(i);
+                        self.reveal_pending(i);
                     }
                     Err(e) => st.diff_error = Some(format!("{e:#}")),
                 }
             }
             GitResult::Diff { wt, id, res } => {
                 let editing = self.editing(&wt);
+                let height = self.pane_height(Pane::Diff);
                 let Some(i) = self.index_of(&wt) else { return };
                 let st = &mut self.wts[i];
                 if st.diff_id != id || editing {
@@ -657,11 +758,89 @@ impl App {
                             st.diff_offset = st.diff_offset.min(last);
                             st.reanchor();
                         }
+                        if let Some(msg) = st.apply_jump(height) {
+                            self.notify(msg.into(), true);
+                        }
                     }
                     Err(e) => st.diff_error = Some(format!("{e:#}")),
                 }
             }
+            GitResult::ResolveComments { wt, head, res } => {
+                let Some(i) = self.index_of(&wt) else { return };
+                let st = &mut self.wts[i];
+                if st.info.head.as_deref() != Some(head.as_str()) {
+                    return;
+                }
+                let mut moves = Vec::new();
+                for (id, r) in res {
+                    // A newer search for the same HEAD may have covered it already.
+                    if st.resolved.get(&id) == Some(&head) {
+                        continue;
+                    }
+                    st.resolved.insert(id, head.clone());
+                    match r {
+                        Resolved::Commit(sha) => moves.push((id, sha)),
+                        Resolved::Nowhere => {
+                            st.stale.insert(id);
+                        }
+                        Resolved::Unknown => {
+                            st.stale.remove(&id);
+                        }
+                    }
+                }
+                if moves.is_empty() {
+                    return;
+                }
+                let res = st.comments.move_to_commits(&moves);
+                st.reanchor();
+                match res {
+                    Ok(()) => {
+                        let n = moves.len();
+                        let s = if n == 1 { "" } else { "s" };
+                        self.notify(
+                            format!("Moved {n} comment{s} to the commit{s} of their lines"),
+                            false,
+                        );
+                        // A jump waiting for a moved comment now has to go to its commit.
+                        let pending = self.wts[i].pending_jump;
+                        if let Some(id) = pending.filter(|id| moves.iter().any(|(m, _)| m == id))
+                            && i == self.active
+                        {
+                            self.jump_to_comment(id);
+                        }
+                    }
+                    Err(e) => self.notify(format!("Moving comments failed: {e:#}"), true),
+                }
+            }
         }
+    }
+
+    /// Looks for the commits of working tree comments whose file has no uncommitted changes
+    /// any more, once per HEAD. Each request covers every comment still unresolved, as the
+    /// worker only keeps the latest one per worktree.
+    fn resolve_comments(&mut self, i: usize) {
+        let st = &mut self.wts[i];
+        let Some(head) = st.info.head.clone().filter(|_| st.loaded) else {
+            return;
+        };
+        let comments: Vec<Comment> = st
+            .comments
+            .comments
+            .iter()
+            .filter(|c| c.commit.is_none() && !st.changed(&c.file))
+            .filter(|c| st.resolved.get(&c.id) != Some(&head))
+            .cloned()
+            .collect();
+        if comments.is_empty() {
+            return;
+        }
+        let sent = (head.clone(), comments.iter().map(|c| c.id).collect());
+        if st.resolve_sent.as_ref() == Some(&sent) {
+            return;
+        }
+        st.resolve_sent = Some(sent);
+        let wt = st.info.path.clone();
+        self.send(Job::ResolveComments { wt, head, comments });
     }
 
     /// Whether a comment input is open for worktree `wt`.
@@ -877,6 +1056,12 @@ impl App {
 
     fn act(&mut self, action: Action) {
         let n = self.wts.len();
+        // Any other key takes over from a comment jump still waiting for its diff.
+        if !matches!(action, Action::NextComment | Action::PrevComment)
+            && let Some(st) = self.wts.get_mut(self.active)
+        {
+            st.pending_jump = None;
+        }
         match action {
             Action::Quit => self.quit = true,
             Action::Help => {
@@ -929,6 +1114,21 @@ impl App {
                 self.notify(msg.into(), false);
             }
             Action::Comment => self.start_comment(),
+            Action::ToggleComments => {
+                self.comments_pane = !self.comments_pane;
+                if let Some(st) = self.wts.get_mut(self.active) {
+                    st.comments_reveal = true;
+                }
+                let msg = if self.comments_pane {
+                    "Comments pane on"
+                } else {
+                    "Comments pane off"
+                };
+                self.notify(msg.into(), false);
+            }
+            Action::NextComment | Action::PrevComment => {
+                self.step_comment(action == Action::NextComment)
+            }
             Action::Escape => {
                 if let Some(st) = self.wts.get_mut(self.active) {
                     st.diff_sel = None;
@@ -944,6 +1144,7 @@ impl App {
             Pane::Tree => self.hit.tree,
             Pane::Diff => self.hit.diff,
             Pane::Commits => self.hit.commits,
+            Pane::Comments => self.hit.comments,
         };
         (r.height as usize).max(1)
     }
@@ -981,6 +1182,7 @@ impl App {
         if let Some(s) = st.diff_sel {
             ensure_visible(&mut st.diff_offset, s, height);
         }
+        st.follow_selection();
     }
 
     fn maybe_load_more(&mut self) {
@@ -1169,6 +1371,7 @@ impl App {
         if let Some(h) = target {
             st.diff_offset = h;
             st.diff_sel = Some((h + 1).min(st.diff.lines.len().saturating_sub(1)));
+            st.follow_selection();
             return;
         }
         // Past the last/first hunk: continue at the top of the next / bottom of the previous file.
@@ -1178,6 +1381,103 @@ impl App {
             let pos = if forward { 0 } else { usize::MAX };
             st.diff_offset = pos;
             st.diff_sel = Some(pos);
+        }
+    }
+
+    /// Jumps to the comment after/before the highlighted one in pane order.
+    fn step_comment(&mut self, forward: bool) {
+        let Some(st) = self.active() else { return };
+        let order = st.comment_order();
+        let all = &st.comments.comments;
+        let cur = st
+            .comment_sel
+            .and_then(|id| order.iter().position(|&ci| all[ci].id == id));
+        let Some(next) = comments::step(order.len(), cur, forward) else {
+            let msg = match (order.is_empty(), forward) {
+                (true, _) => "No comments",
+                (false, true) => "No more comments",
+                (false, false) => "No previous comments",
+            };
+            self.notify(msg.into(), true);
+            return;
+        };
+        let id = all[order[next]].id;
+        self.jump_to_comment(id);
+    }
+
+    /// Highlights comment `id` and shows it: selects its commit, file and line.
+    fn jump_to_comment(&mut self, id: u64) {
+        let active = self.active;
+        let commits_h = self.pane_height(Pane::Commits);
+        let Some(st) = self.wts.get_mut(active) else {
+            return;
+        };
+        let Some(c) = st.comments.comments.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        st.select_comment(Some(id));
+        st.pending_jump = Some(id);
+        if c.commit.as_deref() != st.commit.as_ref().map(|c| c.sha.as_str()) {
+            let target = match &c.commit {
+                None => Some(0),
+                Some(sha) => st.commits.iter().position(|x| &x.sha == sha).map(|p| p + 1),
+            };
+            let Some(target) = target else {
+                st.pending_jump = None;
+                let sha = c.commit.unwrap_or_default();
+                let short = sha.get(..7).unwrap_or(&sha);
+                self.notify(format!("Commit {short} is not in the loaded history"), true);
+                return;
+            };
+            self.select_commit(target);
+            let st = &mut self.wts[active];
+            ensure_visible(&mut st.commit_offset, st.commit_cursor, commits_h);
+            // The file is selected once the commit's files have loaded.
+            if c.commit.is_some() {
+                return;
+            }
+        }
+        self.reveal_pending(active);
+    }
+
+    /// Selects the file of worktree `i`'s pending comment jump in the tree, and its line if
+    /// the diff is already shown.
+    fn reveal_pending(&mut self, i: usize) {
+        let tree_h = self.pane_height(Pane::Tree);
+        let diff_h = self.pane_height(Pane::Diff);
+        let st = &mut self.wts[i];
+        let Some(id) = st.pending_jump else { return };
+        let Some(c) = st.comments.comments.iter().find(|c| c.id == id) else {
+            st.pending_jump = None;
+            return;
+        };
+        if c.commit.as_deref() != st.commit.as_ref().map(|c| c.sha.as_str()) {
+            st.pending_jump = None;
+            return;
+        }
+        let path = c.file.clone();
+        if !st.files().iter().any(|f| f.path == path) {
+            let msg = if st.is_stale(c) {
+                "Comment is stale: its lines are neither in the working tree nor in a commit"
+                    .to_string()
+            } else {
+                format!("{path} has no changes here")
+            };
+            st.pending_jump = None;
+            self.notify(msg, true);
+            return;
+        }
+        st.reveal(&path);
+        let Some(row) =
+            (0..st.rows.len()).find(|&r| st.row_file(r).is_some_and(|f| f.path == path))
+        else {
+            return;
+        };
+        self.select_row(i, row);
+        let st = &mut self.wts[i];
+        ensure_visible(&mut st.tree_offset, st.tree_cursor, tree_h);
+        if let Some(msg) = st.apply_jump(diff_h) {
+            self.notify(msg.into(), true);
         }
     }
 
@@ -1274,15 +1574,41 @@ impl App {
         let st = &mut self.wts[i];
         let body = input.edit.text.trim();
         let mut c = input.comment;
+        let id = c.id;
         let res = if body.is_empty() {
             if !input.existing {
                 return;
             }
-            st.comments.remove(c.id).map(|()| "Comment deleted")
+            let res = st.comments.remove(id).map(|()| "Comment deleted");
+            if res.is_ok() && st.comment_sel == Some(id) {
+                st.comment_sel = None;
+            }
+            res
         } else {
             c.body = body.to_string();
             c.updated = comments::now().0;
-            st.comments.upsert(c).map(|()| "Comment saved")
+            let res = if input.existing {
+                // Only what the input changed: the comment may have been moved to a commit
+                // (or edited by another instance) meanwhile.
+                st.comments.edit(id, |s| {
+                    s.body = c.body;
+                    s.updated = c.updated;
+                    if s.commit == c.commit {
+                        (s.side, s.line, s.line_text, s.start) =
+                            (c.side, c.line, c.line_text, c.start);
+                    }
+                })
+            } else {
+                st.comments.upsert(c).map(|()| true)
+            };
+            match res {
+                Ok(true) => {
+                    st.select_comment(Some(id));
+                    Ok("Comment saved")
+                }
+                Ok(false) => Err(anyhow::anyhow!("it was deleted elsewhere")),
+                Err(e) => Err(e),
+            }
         };
         st.reanchor();
         match res {
@@ -1297,6 +1623,7 @@ impl App {
             (Pane::Tree, self.hit.tree),
             (Pane::Diff, self.hit.diff),
             (Pane::Commits, self.hit.commits),
+            (Pane::Comments, self.hit.comments),
         ]
         .into_iter()
         .find(|(_, r)| r.contains(pos));
@@ -1316,6 +1643,7 @@ impl App {
                 let Some(st) = self.wts.get_mut(active) else {
                     return;
                 };
+                st.pending_jump = None;
                 match pane {
                     Pane::Tree => {
                         let row = st.tree_offset + rel;
@@ -1333,6 +1661,7 @@ impl App {
                         if line < st.diff.lines.len() {
                             st.diff_sel = Some(line);
                             st.diff_anchor = None;
+                            st.follow_selection();
                         }
                     }
                     Pane::Commits => {
@@ -1340,6 +1669,11 @@ impl App {
                         if row <= st.commits.len() {
                             self.select_commit(row);
                             self.maybe_load_more();
+                        }
+                    }
+                    Pane::Comments => {
+                        if let Some(id) = crate::ui::comment_at_row(st, rel, rect.width) {
+                            self.jump_to_comment(id);
                         }
                     }
                 }
@@ -1380,6 +1714,14 @@ impl App {
                             (st.commits.len() + 1).saturating_sub(h) + 1,
                         );
                         self.maybe_load_more();
+                    }
+                    // One entry per wheel step; rendering clamps.
+                    Pane::Comments => {
+                        st.comments_offset = offset(
+                            st.comments_offset,
+                            delta.signum(),
+                            st.comments.comments.len(),
+                        )
                     }
                 }
             }

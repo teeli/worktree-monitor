@@ -1,6 +1,6 @@
 //! Line comments, stored as JSON per worktree under the XDG state directory.
 
-use crate::diff::{Diff, LineKind};
+use crate::diff::{Diff, DiffLine, LineKind};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: u32 = 1;
+/// Furthest a committed line may be from where a working tree comment was written.
+const MAX_DRIFT: u32 = 100;
 /// JSON schema of the comment files; written next to them and referenced by `$schema`.
 const SCHEMA: &str = include_str!("../schema/comments.schema.json");
 const SCHEMA_FILE: &str = "comments.schema.json";
@@ -190,6 +192,61 @@ impl Store {
     pub fn remove(&mut self, id: u64) -> Result<()> {
         self.modify(|all| all.retain(|c| c.id != id))
     }
+
+    /// Applies `f` to the stored comment `id`, leaving all others as they are on disk.
+    /// Returns whether the comment still exists.
+    pub fn edit(&mut self, id: u64, f: impl FnOnce(&mut Comment)) -> Result<bool> {
+        let mut found = false;
+        self.modify(|all| {
+            if let Some(c) = all.iter_mut().find(|c| c.id == id) {
+                f(c);
+                found = true;
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// Moves working tree comments to the commits their lines were committed in.
+    pub fn move_to_commits(&mut self, moves: &[(u64, String)]) -> Result<()> {
+        self.modify(|all| {
+            for c in all.iter_mut().filter(|c| c.commit.is_none()) {
+                if let Some((_, sha)) = moves.iter().find(|(id, _)| *id == c.id) {
+                    c.commit = Some(sha.clone());
+                }
+            }
+        })
+    }
+}
+
+/// The commit in `history` (oldest first) a working tree comment's line was most likely
+/// committed in: one adding (or, on the old side, removing) a line with its text within
+/// `MAX_DRIFT` lines of where it was, the nearest such line winning, then the oldest commit.
+/// A range comment's first line must appear in that commit's diff too. Comments on unchanged
+/// lines can't be told apart from any other commit touching the file, so they find nothing.
+pub fn resolve_commit<'a>(c: &Comment, history: &'a [(String, Diff)]) -> Option<&'a str> {
+    let changed = match c.side {
+        Side::New => LineKind::Add,
+        Side::Old => LineKind::Del,
+    };
+    let matches = |l: &DiffLine| l.kind == changed && l.text == c.line_text;
+    let has_start = |d: &Diff| {
+        c.start
+            .as_ref()
+            .is_none_or(|s| d.lines.iter().any(|l| l.text == s.text))
+    };
+    history
+        .iter()
+        .enumerate()
+        .filter_map(|(k, (sha, d))| {
+            let dist = (0..d.lines.len())
+                .filter(|&i| matches(&d.lines[i]))
+                .filter_map(|i| line_no(d, i, c.side))
+                .map(|n| n.abs_diff(c.line))
+                .min()?;
+            (dist <= MAX_DRIFT && has_start(d)).then_some((dist, k, sha.as_str()))
+        })
+        .min_by_key(|&(dist, k, _)| (dist, k))
+        .map(|(_, _, sha)| sha)
 }
 
 /// Where the comments of one diff are shown.
@@ -218,6 +275,37 @@ impl Anchors {
     pub fn total(&self) -> usize {
         self.by_line.len() + self.outdated
     }
+}
+
+/// Indices of `comments` in display order: working tree first, then by commit in log order
+/// (`rank` gives a commit's position in the log), then commits not in the log by age; within
+/// each, by file and line.
+pub fn order(comments: &[Comment], rank: impl Fn(&str) -> Option<usize>) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..comments.len()).collect();
+    idx.sort_by_cached_key(|&i| {
+        let c = &comments[i];
+        let group = match c.commit.as_deref() {
+            None => (0, 0, 0),
+            Some(sha) => match rank(sha) {
+                Some(r) => (1, r, 0),
+                None => (2, 0, c.created),
+            },
+        };
+        (group, c.file.clone(), c.line)
+    });
+    idx
+}
+
+/// Position after/before `cur` in a list of `len`; from outside the list (`None`) the first or
+/// last one. `None` past the ends.
+pub fn step(len: usize, cur: Option<usize>, forward: bool) -> Option<usize> {
+    let next = match (cur, forward) {
+        (Some(c), true) => c + 1,
+        (Some(c), false) => c.checked_sub(1)?,
+        (None, true) => 0,
+        (None, false) => len.checked_sub(1)?,
+    };
+    (next < len).then_some(next)
 }
 
 /// Line number of a commentable diff line on `side`.
@@ -377,13 +465,91 @@ mod tests {
         assert_eq!(s2.comments.len(), 2);
         assert_eq!(s2.comments[1], c);
         s.remove(1).unwrap();
-        assert_eq!(Store::load_from(wt, Some(path.clone())).comments, vec![c]);
+        assert_eq!(
+            Store::load_from(wt, Some(path.clone())).comments,
+            vec![c.clone()]
+        );
+        // Only working tree comments move.
+        s.move_to_commits(&[(2, "def".into())]).unwrap();
+        assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
+        // Edits touch only the given comment, and only what `f` changes.
+        assert!(s.edit(2, |c| c.body = "patched".into()).unwrap());
+        let stored = &Store::load_from(wt, Some(path.clone())).comments[0];
+        assert_eq!((stored.body.as_str(), stored.line), ("patched", 4));
+        assert!(!s.edit(99, |_| unreachable!()).unwrap());
 
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, Some(path.clone()));
         assert!(broken.error.is_some());
         assert!(broken.upsert(comment(3, Side::New, 1, "x", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn orders_comments() {
+        let mut cs = vec![
+            comment(1, Side::New, 9, "x", Some("old")),
+            comment(2, Side::New, 5, "x", Some("gone2")),
+            comment(3, Side::New, 2, "x", None),
+            comment(4, Side::New, 1, "x", Some("new")),
+            comment(5, Side::New, 1, "x", Some("gone1")),
+            comment(6, Side::New, 1, "x", None),
+            comment(7, Side::New, 1, "x", Some("old")),
+        ];
+        cs[1].created = 2;
+        cs[4].created = 1;
+        cs[6].file = "e".into();
+        let log = ["new", "old"];
+        let o = order(&cs, |sha| log.iter().position(|s| *s == sha));
+        let ids: Vec<u64> = o.into_iter().map(|i| cs[i].id).collect();
+        assert_eq!(ids, vec![6, 3, 4, 7, 1, 5, 2]);
+    }
+
+    #[test]
+    fn resolves_committed_comments() {
+        let h = |sha: &str, raw: &str| (sha.to_string(), diff::parse(raw));
+        let history = vec![
+            h("a", "@@ -1,2 +1,2 @@\n x\n-y\n+z\n"),
+            h("b", "@@ -1,2 +1,3 @@\n x\n z\n+w\n"),
+        ];
+        let r = |c: Comment| resolve_commit(&c, &history).map(String::from);
+        assert_eq!(r(comment(1, Side::New, 2, "z", None)).as_deref(), Some("a"));
+        assert_eq!(r(comment(2, Side::Old, 2, "y", None)).as_deref(), Some("a"));
+        assert_eq!(r(comment(3, Side::New, 3, "w", None)).as_deref(), Some("b"));
+        // Unchanged lines are ambiguous.
+        assert_eq!(r(comment(4, Side::New, 1, "x", None)), None);
+        assert_eq!(r(comment(5, Side::New, 1, "gone", None)), None);
+
+        // A common line: the nearest match wins, far-away ones don't count.
+        let history = vec![
+            h("far", "@@ -500,1 +500,2 @@\n a\n+}\n"),
+            h("near", "@@ -10,1 +10,2 @@\n a\n+}\n"),
+        ];
+        let r = |c: Comment| resolve_commit(&c, &history).map(String::from);
+        assert_eq!(
+            r(comment(6, Side::New, 12, "}", None)).as_deref(),
+            Some("near")
+        );
+        assert_eq!(r(comment(7, Side::New, 300, "}", None)), None);
+        // A range's first line must be in the same commit.
+        let mut range = comment(8, Side::New, 11, "}", None);
+        range.start = Some(LinePos {
+            side: Side::New,
+            line: 9,
+            text: "missing".into(),
+        });
+        assert_eq!(r(range), None);
+    }
+
+    #[test]
+    fn steps_through_list() {
+        assert_eq!(step(3, None, true), Some(0));
+        assert_eq!(step(3, None, false), Some(2));
+        assert_eq!(step(3, Some(1), true), Some(2));
+        assert_eq!(step(3, Some(2), true), None);
+        assert_eq!(step(3, Some(0), false), None);
+        assert_eq!(step(0, None, true), None);
+        assert_eq!(step(0, None, false), None);
     }
 
     #[test]

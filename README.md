@@ -17,6 +17,11 @@ commit history, side by side and updating in near-realtime.
   changes, and are marked by a bar in the gutter. They are stored as JSON per worktree in `$XDG_STATE_HOME/wtm`
   (default `~/.local/state/wtm`); the format is described by [`schema/comments.schema.json`](schema/comments.schema.json),
   a copy of which is written next to the files and linked from their `$schema`.
+- **Comments pane** (`C`) on the right lists every comment of the worktree, working tree and commits alike.
+  `Ctrl-n` / `Ctrl-p` (or a click on an entry) jump to a comment, switching to its commit, file and line.
+  Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found
+  in any commit since (e.g. the changes were discarded), it is marked *stale*. Comments on unchanged lines can't be
+  traced to a commit and become stale as well.
 - **Copy the file path to the clipboard,** with `:line` (or `:start-end`) appended when diff lines are selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
   when file watching is unavailable). Adding or removing worktrees updates
@@ -59,9 +64,11 @@ Press `?` in the app for the full list.
 | | `Shift-↓` `Shift-↑` | Extend the line selection to a range |
 | | `h` `l` / `←` `→` | Scroll horizontally |
 | | `w` | Toggle soft wrap (off by default) |
-| | `c` | Comment on the selected line (edit if it has one; save empty to delete) |
 | | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Half page / page / top / bottom |
 | | `Esc` | Clear line selection |
+| Comments | `c` | Comment on the selected line (edit if it has one; save empty to delete) |
+| | `C` | Toggle the comments pane |
+| | `Ctrl-n` / `Ctrl-p` | Jump to next / previous comment (switching commit and file as needed) |
 | File tree | `Enter` / `Space` | Toggle directory (of the current file) |
 | | `H` / `Shift-←` | Collapse directory and all subdirectories |
 | | `L` / `Shift-→` | Expand directory and all subdirectories |
