@@ -177,7 +177,7 @@ fn comment_files(dir: &Path) -> Result<Vec<(PathBuf, CommentFile)>> {
         .collect())
 }
 
-/// Why the worktree of an [`Orphan`] is considered gone.
+/// Why the worktree of a comment file is considered gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gone {
     /// Its repository exists but no longer has it.
@@ -188,20 +188,47 @@ pub enum Gone {
     Unknown,
 }
 
-/// A comment file whose worktree directory no longer exists.
+/// Why a comment file is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    Gone(Gone),
+    /// Untouched for this many days.
+    Idle(u64),
+}
+
+/// A comment file, as seen by `wtm prune`.
 #[derive(Debug)]
-pub struct Orphan {
+pub struct Entry {
     pub path: PathBuf,
     pub worktree: PathBuf,
     pub comments: usize,
-    pub gone: Gone,
+    /// `None` while the worktree exists, or may (e.g. still registered or unreachable).
+    pub gone: Option<Gone>,
+    /// Unix seconds of the newest comment change; the file's mtime when it has no comments.
+    pub touched: u64,
 }
 
-/// The comments directory and its files whose worktrees are gone, across all repositories.
-pub fn orphans() -> Result<(PathBuf, Vec<Orphan>)> {
+impl Entry {
+    /// Whether the file is stale: its worktree is gone (`Gone::Worktree`, or any with
+    /// `deleted_repos`), or it was untouched for at least `max_age` days as of `now`.
+    pub fn stale(&self, deleted_repos: bool, max_age: Option<u64>, now: u64) -> Option<Stale> {
+        match self.gone {
+            Some(g @ Gone::Worktree) => return Some(Stale::Gone(g)),
+            Some(g) if deleted_repos => return Some(Stale::Gone(g)),
+            _ => {}
+        }
+        let days = now.saturating_sub(self.touched) / 86_400;
+        max_age
+            .is_some_and(|max| days >= max)
+            .then_some(Stale::Idle(days))
+    }
+}
+
+/// The comments directory and all its comment files, across all repositories.
+pub fn scan() -> Result<(PathBuf, Vec<Entry>)> {
     let dir =
         comments_dir().ok_or_else(|| anyhow!("no state directory (set XDG_STATE_HOME or HOME)"))?;
-    let found = orphans_in(&dir)?;
+    let found = scan_in(&dir)?;
     Ok((dir, found))
 }
 
@@ -213,39 +240,47 @@ struct Registered {
     main_unknown: bool,
 }
 
-fn orphans_in(dir: &Path) -> Result<Vec<Orphan>> {
+fn scan_in(dir: &Path) -> Result<Vec<Entry>> {
     let mut repos: HashMap<PathBuf, Option<Registered>> = HashMap::new();
     let mut found = Vec::new();
     for (path, file) in comment_files(dir)? {
         // Unreachable (e.g. permission denied or a stale network mount) isn't gone.
-        if !matches!(file.worktree.try_exists(), Ok(false)) {
-            continue;
-        }
-        let gone = match &file.repo {
-            None => Gone::Unknown,
-            Some(r) => match r.try_exists() {
-                Ok(false) => Gone::Repo,
-                Err(_) => continue,
-                Ok(true) => {
-                    let reg = repos.entry(r.clone()).or_insert_with(|| registered(r));
-                    // Missing but still registered (e.g. on an unmounted volume) isn't removed.
-                    match reg {
-                        Some(reg)
-                            if !reg.main_unknown
-                                && !reg.paths.iter().any(|p| same_path(p, &file.worktree)) =>
-                        {
-                            Gone::Worktree
-                        }
-                        _ => continue,
+        let gone = if !matches!(file.worktree.try_exists(), Ok(false)) {
+            None
+        } else {
+            match &file.repo {
+                None => Some(Gone::Unknown),
+                Some(r) => match r.try_exists() {
+                    Ok(false) => Some(Gone::Repo),
+                    Err(_) => None,
+                    Ok(true) => {
+                        let reg = repos.entry(r.clone()).or_insert_with(|| registered(r));
+                        // Missing but still registered (e.g. on an unmounted volume) isn't gone.
+                        reg.as_ref()
+                            .is_some_and(|reg| {
+                                !reg.main_unknown
+                                    && !reg.paths.iter().any(|p| same_path(p, &file.worktree))
+                            })
+                            .then_some(Gone::Worktree)
                     }
-                }
-            },
+                },
+            }
         };
-        found.push(Orphan {
+        let touched = match file.comments.iter().map(|c| c.created.max(c.updated)).max() {
+            Some(t) => t,
+            // Unknown counts as now, so it never looks old.
+            None => std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or_else(|| now().0, |d| d.as_secs()),
+        };
+        found.push(Entry {
             path,
             worktree: file.worktree,
             comments: file.comments.len(),
             gone,
+            touched,
         });
     }
     found.sort_by(|a, b| a.worktree.cmp(&b.worktree));
@@ -785,7 +820,45 @@ mod tests {
     }
 
     #[test]
-    fn finds_orphans() {
+    fn picks_stale_entries() {
+        let day = 86_400;
+        let entry = |gone, touched| Entry {
+            path: PathBuf::new(),
+            worktree: PathBuf::new(),
+            comments: 0,
+            gone,
+            touched,
+        };
+        let now = 100 * day;
+        let fresh = entry(None, now - day);
+        let old = entry(None, now - 30 * day);
+        let removed = entry(Some(Gone::Worktree), now);
+        let old_unknown = entry(Some(Gone::Unknown), now - 40 * day);
+        assert_eq!(fresh.stale(true, Some(2), now), None);
+        assert_eq!(fresh.stale(false, Some(1), now), Some(Stale::Idle(1)));
+        assert_eq!(old.stale(true, None, now), None);
+        assert_eq!(old.stale(false, Some(30), now), Some(Stale::Idle(30)));
+        assert_eq!(old.stale(false, Some(31), now), None);
+        assert_eq!(
+            removed.stale(false, None, now),
+            Some(Stale::Gone(Gone::Worktree))
+        );
+        // Age alone is enough, without `deleted_repos`.
+        assert_eq!(old_unknown.stale(false, None, now), None);
+        assert_eq!(
+            old_unknown.stale(false, Some(30), now),
+            Some(Stale::Idle(40))
+        );
+        assert_eq!(
+            old_unknown.stale(true, Some(30), now),
+            Some(Stale::Gone(Gone::Unknown))
+        );
+        // Touched in the future (clock skew) is fresh.
+        assert_eq!(entry(None, now + day).stale(false, Some(1), now), None);
+    }
+
+    #[test]
+    fn scans_comment_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let comments = root.join("comments");
@@ -850,25 +923,29 @@ mod tests {
         )
         .unwrap();
 
-        let found: Vec<_> = orphans_in(&comments)
+        let found: Vec<_> = scan_in(&comments)
             .unwrap()
             .into_iter()
-            .map(|o| {
-                assert_eq!(o.path, comments.join(file_name(&o.worktree)));
-                assert_eq!(o.comments, 1);
-                (o.worktree.strip_prefix(&root).unwrap().to_owned(), o.gone)
+            .map(|e| {
+                assert_eq!(e.path, comments.join(file_name(&e.worktree)));
+                assert_eq!((e.comments, e.touched), (1, 0));
+                (e.worktree.strip_prefix(&root).unwrap().to_owned(), e.gone)
             })
             .collect();
         let p = PathBuf::from;
         assert_eq!(
             found,
             vec![
-                (p("gone-repo"), Gone::Repo),
-                (p("legacy"), Gone::Unknown),
-                (p("removed"), Gone::Worktree),
+                (p("away"), None),
+                (p("gone-repo"), Some(Gone::Repo)),
+                (p("legacy"), Some(Gone::Unknown)),
+                (p("main"), None),
+                (p("rel"), None),
+                (p("removed"), Some(Gone::Worktree)),
+                (p("sepwt"), None),
             ]
         );
-        assert!(orphans_in(&root.join("none")).unwrap().is_empty());
+        assert!(scan_in(&root.join("none")).unwrap().is_empty());
     }
 
     #[test]

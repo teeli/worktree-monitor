@@ -46,13 +46,22 @@ enum Command {
         /// looks deleted too.
         #[arg(long)]
         deleted_repos: bool,
+        /// Also include files whose comments weren't added or edited in this many days, even
+        /// if their worktree still exists.
+        #[arg(long, value_name = "DAYS")]
+        age: Option<u64>,
     },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if let Some(Command::Prune { yes, deleted_repos }) = args.command {
-        return prune(yes, deleted_repos);
+    if let Some(Command::Prune {
+        yes,
+        deleted_repos,
+        age,
+    }) = args.command
+    {
+        return prune(yes, deleted_repos, age);
     }
     let repo = git::discover(&std::env::current_dir()?)?;
 
@@ -91,36 +100,44 @@ fn main() -> Result<()> {
     res
 }
 
-/// `wtm prune`: lists (and with `yes`, deletes) comment files of removed worktrees.
-fn prune(yes: bool, deleted_repos: bool) -> Result<()> {
-    use comments::Gone;
-    let (dir, orphans) = comments::orphans()?;
-    let (picked, kept): (Vec<_>, Vec<_>) = orphans
-        .into_iter()
-        .partition(|o| deleted_repos || o.gone == Gone::Worktree);
+/// `wtm prune`: lists (and with `yes`, deletes) stale comment files.
+fn prune(yes: bool, deleted_repos: bool, age: Option<u64>) -> Result<()> {
+    use comments::{Gone, Stale};
+    let (dir, entries) = comments::scan()?;
+    let now = comments::now().0;
+    let mut picked = Vec::new();
+    let mut skipped = 0;
+    for e in &entries {
+        match e.stale(deleted_repos, age, now) {
+            Some(why) => picked.push((e, why)),
+            None if matches!(e.gone, Some(Gone::Repo | Gone::Unknown)) => skipped += 1,
+            None => {}
+        }
+    }
     if picked.is_empty() {
         println!("No stale comment files in {}", dir.display());
     } else {
         println!("Stale comment files in {}:", dir.display());
-        for o in &picked {
-            let s = if o.comments == 1 { "" } else { "s" };
-            let why = match o.gone {
-                Gone::Worktree => "worktree removed",
-                Gone::Repo => "repository missing",
-                Gone::Unknown => "repository unknown",
+        for (e, why) in &picked {
+            let s = if e.comments == 1 { "" } else { "s" };
+            let why = match why {
+                Stale::Gone(Gone::Worktree) => "worktree removed".to_string(),
+                Stale::Gone(Gone::Repo) => "repository missing".to_string(),
+                Stale::Gone(Gone::Unknown) => "repository unknown".to_string(),
+                Stale::Idle(1) => "untouched for 1 day".to_string(),
+                Stale::Idle(days) => format!("untouched for {days} days"),
             };
             println!(
                 "  {:>3} comment{s:<1}  {}  ({why})",
-                o.comments,
-                o.worktree.display()
+                e.comments,
+                e.worktree.display()
             );
         }
     }
-    if !kept.is_empty() {
-        let n = kept.len();
-        let s = if n == 1 { "" } else { "s" };
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
         println!(
-            "{n} file{s} of missing or unknown repositories skipped; add --deleted-repos to include them"
+            "{skipped} file{s} of missing or unknown repositories skipped; add --deleted-repos to include them"
         );
     }
     if picked.is_empty() {
@@ -131,9 +148,9 @@ fn prune(yes: bool, deleted_repos: bool) -> Result<()> {
         return Ok(());
     }
     let mut failed = 0;
-    for o in &picked {
-        if let Err(e) = std::fs::remove_file(&o.path) {
-            eprintln!("removing {}: {e}", o.path.display());
+    for (e, _) in &picked {
+        if let Err(err) = std::fs::remove_file(&e.path) {
+            eprintln!("removing {}: {err}", e.path.display());
             failed += 1;
         }
     }

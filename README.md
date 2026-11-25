@@ -73,11 +73,13 @@ repositories at once, without starting the TUI:
 wtm prune                    # list comment files whose worktrees were removed
 wtm prune --yes              # delete them
 wtm prune --deleted-repos    # also include repositories that no longer exist
+wtm prune --age 30           # also include files with no comment added or edited in 30 days
 ```
 
 Worktrees git still lists are kept even when their directory is missing, e.g. on an unmounted volume.
 `--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume, and also
-includes files from older versions of `wtm` that didn't record their repository.
+includes files from older versions of `wtm` that didn't record their repository. `--age` applies to every file,
+including those of existing worktrees.
 
 ## Keys
 
