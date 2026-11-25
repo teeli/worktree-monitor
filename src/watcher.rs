@@ -3,7 +3,7 @@
 use crate::app::AppEvent;
 use anyhow::Context;
 use notify::{ErrorKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, Debouncer, new_debouncer};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -21,10 +21,14 @@ pub struct FsWatcher {
 /// falls back to polling instead of silently missing events.
 pub fn watch(paths: &[PathBuf], tx: Sender<AppEvent>) -> anyhow::Result<FsWatcher> {
     let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| {
-        // Queue overflows arrive as path-less rescan events, which the debouncer drops;
-        // the periodic fallback refresh covers those.
         let _ = tx.send(match res {
-            Ok(events) => AppEvent::Fs(events.into_iter().map(|e| e.path).collect()),
+            Ok(DebouncedEventBatch::Events(events)) => {
+                AppEvent::Fs(events.into_iter().map(|e| e.path).collect())
+            }
+            // Rescan (e.g. a queue overflow): events were missed, so refresh everything.
+            Ok(_) => AppEvent::FsError {
+                out_of_watches: false,
+            },
             Err(e) => AppEvent::FsError {
                 out_of_watches: matches!(e.kind, ErrorKind::MaxFilesWatch),
             },
