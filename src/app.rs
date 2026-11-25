@@ -419,17 +419,18 @@ impl App {
             next_id: 1,
             clipboard: Clipboard::default(),
         };
-        let live: Vec<&Path> = app.wts.iter().map(|w| w.canon.as_path()).collect();
-        match comments::prune(&app.common_canon, &live) {
-            Ok(0) => {}
-            Ok(n) => app.notify(
-                format!(
-                    "Removed {n} stale comment file{}",
-                    if n == 1 { "" } else { "s" }
-                ),
-                false,
-            ),
-            Err(e) => app.notify(format!("Cleaning up comments failed: {e:#}"), true),
+        // A registered worktree whose directory is missing (e.g. on an unmounted volume) has no
+        // canonical path to match its comment file by; wait until git prunes it.
+        if app.wts.iter().all(|w| w.info.exists()) {
+            let live: Vec<&Path> = app.wts.iter().map(|w| w.canon.as_path()).collect();
+            let (removed, error) = comments::prune(&app.common_canon, &live);
+            if removed > 0 {
+                let s = if removed == 1 { "" } else { "s" };
+                app.notify(format!("Removed {removed} stale comment file{s}"), false);
+            }
+            if let Some(e) = error {
+                app.notify(format!("Cleaning up comments failed: {e:#}"), true);
+            }
         }
         if let Some(e) = app.wts.iter().find_map(|w| w.comments.error.clone()) {
             app.notify(format!("Comments unreadable: {e}"), true);

@@ -122,23 +122,29 @@ fn write(path: &Path, mut file: CommentFile) -> Result<CommentFile> {
 }
 
 /// Deletes the comment files of `repo`'s worktrees that are no longer in `live`, returning how
-/// many. Files from older versions without a repo are tagged if their worktree is live.
-pub fn prune(repo: &Path, live: &[&Path]) -> Result<usize> {
+/// many and the first error. Files from older versions without a repo are tagged if their
+/// worktree is live. A failing file doesn't stop the others.
+pub fn prune(repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
     match comments_dir() {
         Some(dir) => prune_in(&dir, repo, live),
-        None => Ok(0),
+        None => (0, None),
     }
 }
 
-fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> Result<usize> {
+fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, None),
+        Err(e) => {
+            return (
+                0,
+                Some(anyhow!(e).context(format!("reading {}", dir.display()))),
+            );
+        }
     };
     let mut removed = 0;
-    for entry in entries {
-        let path = entry?.path();
+    let mut error = None;
+    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
@@ -153,20 +159,21 @@ fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> Result<usize> {
             continue;
         }
         let is_live = live.contains(&file.worktree.as_path());
-        match &file.repo {
-            Some(r) if r == repo && !is_live => {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("removing {}", path.display()))?;
-                removed += 1;
-            }
+        let res = match &file.repo {
+            Some(r) if r == repo && !is_live => std::fs::remove_file(&path)
+                .map(|()| removed += 1)
+                .with_context(|| format!("removing {}", path.display())),
             None if is_live => {
                 file.repo = Some(repo.to_path_buf());
-                write(&path, file)?;
+                write(&path, file).map(drop)
             }
-            _ => {}
+            _ => Ok(()),
+        };
+        if let Err(e) = res {
+            error.get_or_insert(e);
         }
     }
-    Ok(removed)
+    (removed, error)
 }
 
 pub fn now() -> (u64, u64) {
@@ -643,7 +650,9 @@ mod tests {
         std::fs::copy(&dead, &renamed).unwrap();
 
         let wts = [Path::new("/live"), Path::new("/legacy-live")];
-        assert_eq!(prune_in(dir.path(), repo, &wts).unwrap(), 1);
+        let (removed, error) = prune_in(dir.path(), repo, &wts);
+        assert_eq!(removed, 1);
+        assert!(error.is_none());
         assert!(!dead.exists());
         for p in [&live, &other, &legacy_live, &legacy_dead, &broken, &renamed] {
             assert!(p.exists(), "{} was removed", p.display());
@@ -651,10 +660,31 @@ mod tests {
         let tagged: CommentFile =
             serde_json::from_slice(&std::fs::read(&legacy_live).unwrap()).unwrap();
         assert_eq!(tagged.repo.as_deref(), Some(repo));
-        assert_eq!(
-            prune_in(&dir.path().join("missing"), repo, &wts).unwrap(),
-            0
-        );
+        let (removed, error) = prune_in(&dir.path().join("missing"), repo, &wts);
+        assert_eq!(removed, 0);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn prune_continues_after_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |wt: &str, repo: Option<&str>| {
+            let path = dir.path().join(file_name(Path::new(wt)));
+            let mut json = serde_json::json!({"version": 1, "worktree": wt, "comments": []});
+            if let Some(r) = repo {
+                json["repo"] = r.into();
+            }
+            std::fs::write(&path, json.to_string()).unwrap();
+            path
+        };
+        // Tagging this one fails: its temp file path is taken by a directory.
+        let stuck = put("/live", None);
+        std::fs::create_dir(stuck.with_extension("json.tmp")).unwrap();
+        let dead = put("/dead", Some("/repo/.git"));
+        let (removed, error) = prune_in(dir.path(), Path::new("/repo/.git"), &[Path::new("/live")]);
+        assert_eq!(removed, 1);
+        assert!(!dead.exists());
+        assert!(error.is_some());
     }
 
     #[test]
