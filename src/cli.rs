@@ -1,21 +1,33 @@
 //! `wtm comments …`: reading and closing the current worktree's comments without the TUI,
-//! e.g. by an AI agent that handled them.
+//! e.g. by an AI agent that handled them, and cleaning up comment files of removed worktrees.
 
-use crate::comments::{self, Closed, Comment, Store};
+use crate::comments::{self, Closed, Comment, Entry, Gone, Store};
 use crate::git;
 use anyhow::{Result, bail};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use std::io::Write;
+use std::path::Path;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List, close or reopen the comments of the current worktree.
+    /// List, close or reopen the comments of the current worktree; `prune` cleans up stale
+    /// comment files of all repositories.
     #[command(subcommand)]
     Comments(CommentsCmd),
 }
 
 #[derive(Subcommand)]
 pub enum CommentsCmd {
+    #[command(flatten)]
+    Worktree(WorktreeCmd),
+    /// List comment files of removed worktrees across all repositories, and delete them with
+    /// `--yes`. Doesn't need a repository.
+    Prune(PruneArgs),
+}
+
+/// Commands on the comments of the current worktree.
+#[derive(Subcommand)]
+pub enum WorktreeCmd {
     /// List open comments: id, file:line, commit (if any), then the indented body.
     List {
         /// Include closed comments.
@@ -41,27 +53,53 @@ pub enum CommentsCmd {
     },
 }
 
-pub fn run(cmd: Command) -> Result<()> {
-    let Command::Comments(cmd) = cmd;
-    let repo = git::discover(&std::env::current_dir()?)?;
-    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let mut store = Store::load(&canon(&repo.toplevel), &canon(&repo.common_dir));
-    comments_cmd(cmd, &mut store, &mut std::io::stdout().lock())
+#[derive(Args)]
+pub struct PruneArgs {
+    /// Delete the listed files instead of only listing them.
+    #[arg(long, short)]
+    yes: bool,
+    /// Also include files whose repository no longer exists on disk, or wasn't recorded
+    /// (files from older versions). Careful: a repository on a volume that isn't mounted
+    /// looks deleted too.
+    #[arg(long)]
+    deleted_repos: bool,
+    /// Also include files whose comments weren't added or edited in this many days, even
+    /// if their worktree still exists.
+    #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u64).range(1..))]
+    age: Option<u64>,
 }
 
-fn comments_cmd(cmd: CommentsCmd, store: &mut Store, out: &mut impl Write) -> Result<()> {
+pub fn run(cmd: Command) -> Result<()> {
+    let Command::Comments(cmd) = cmd;
+    match cmd {
+        CommentsCmd::Worktree(cmd) => {
+            let repo = git::discover(&std::env::current_dir()?)?;
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let mut store = Store::load(&canon(&repo.toplevel), &canon(&repo.common_dir));
+            comments_cmd(cmd, &mut store, &mut std::io::stdout().lock())
+        }
+        CommentsCmd::Prune(args) => {
+            let (dir, entries) = comments::scan()?;
+            let now = comments::now().0;
+            let out = &mut std::io::stdout().lock();
+            prune(&dir, &entries, &args, now, out, &mut std::io::stderr())
+        }
+    }
+}
+
+fn comments_cmd(cmd: WorktreeCmd, store: &mut Store, out: &mut impl Write) -> Result<()> {
     if let Some(e) = &store.error {
         bail!("comments unreadable: {e}");
     }
     let (ids, closed) = match cmd {
-        CommentsCmd::List { all, json } => return list(store, all, json, out),
-        CommentsCmd::Close { ids, by } => {
+        WorktreeCmd::List { all, json } => return list(store, all, json, out),
+        WorktreeCmd::Close { ids, by } => {
             if by.trim().is_empty() {
                 bail!("--by must not be empty");
             }
             (ids, Some(by))
         }
-        CommentsCmd::Reopen { ids } => (ids, None),
+        WorktreeCmd::Reopen { ids } => (ids, None),
     };
     let verb = if closed.is_some() {
         "Closed"
@@ -123,6 +161,81 @@ fn list(store: &Store, all: bool, json: bool, out: &mut impl Write) -> Result<()
     Ok(())
 }
 
+/// Lists the stale comment files among `entries` (in `dir`) and, with `--yes`, deletes them.
+/// Deletion failures go to `err`; any makes it fail after trying the rest.
+fn prune(
+    dir: &Path,
+    entries: &[Entry],
+    args: &PruneArgs,
+    now: u64,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
+    let mut picked = Vec::new();
+    let (mut skipped, mut listed) = (0, 0);
+    for e in entries {
+        match (e.stale(args.deleted_repos, args.age, now), e.gone) {
+            (Some(why), _) => picked.push((e, why)),
+            (None, Some(Gone::Repo | Gone::Unknown)) => skipped += 1,
+            (None, Some(Gone::Listed)) => listed += 1,
+            (None, _) => {}
+        }
+    }
+    if picked.is_empty() {
+        writeln!(out, "No stale comment files in {}", dir.display())?;
+    } else {
+        writeln!(out, "Stale comment files in {}:", dir.display())?;
+        for (e, why) in &picked {
+            writeln!(
+                out,
+                "  {:>3} comment{:<1}  {}  ({why})",
+                e.comments,
+                plural(e.comments),
+                e.worktree.display()
+            )?;
+        }
+    }
+    if skipped > 0 {
+        writeln!(
+            out,
+            "{skipped} file{} of missing or unknown repositories skipped; add --deleted-repos to include them",
+            plural(skipped)
+        )?;
+    }
+    if listed > 0 {
+        writeln!(
+            out,
+            "{listed} file{} of missing worktrees their repository still lists skipped; if they were deleted, run `git worktree prune` there first",
+            plural(listed)
+        )?;
+    }
+    if picked.is_empty() {
+        return Ok(());
+    }
+    if !args.yes {
+        writeln!(out, "Run with --yes to delete them")?;
+        return Ok(());
+    }
+    let mut failed = 0;
+    for (e, _) in &picked {
+        if let Err(io) = std::fs::remove_file(&e.path) {
+            // Best effort: an unwritable stderr mustn't stop the remaining deletions.
+            let _ = writeln!(err, "removing {}: {io}", e.path.display());
+            failed += 1;
+        }
+    }
+    let removed = picked.len() - failed;
+    writeln!(out, "Removed {removed} file{}", plural(removed))?;
+    if failed > 0 {
+        bail!("{failed} file{} could not be removed", plural(failed));
+    }
+    Ok(())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,14 +259,14 @@ mod tests {
         }
     }
 
-    fn run(store: &mut Store, cmd: CommentsCmd) -> (Result<()>, String) {
+    fn run(store: &mut Store, cmd: WorktreeCmd) -> (Result<()>, String) {
         let mut out = Vec::new();
         let res = comments_cmd(cmd, store, &mut out);
         (res, String::from_utf8(out).unwrap())
     }
 
-    fn list(all: bool, json: bool) -> CommentsCmd {
-        CommentsCmd::List { all, json }
+    fn list(all: bool, json: bool) -> WorktreeCmd {
+        WorktreeCmd::List { all, json }
     }
 
     #[test]
@@ -174,7 +287,7 @@ mod tests {
 
         let (res, out) = run(
             &mut s,
-            CommentsCmd::Close {
+            WorktreeCmd::Close {
                 ids: vec![2],
                 by: "claude".into(),
             },
@@ -199,12 +312,12 @@ mod tests {
         assert_eq!(json[1]["closed"]["by"], "claude");
 
         // Unknown ids fail, after the known ones were handled.
-        let (res, out) = run(&mut s, CommentsCmd::Reopen { ids: vec![2, 9] });
+        let (res, out) = run(&mut s, WorktreeCmd::Reopen { ids: vec![2, 9] });
         assert!(res.unwrap_err().to_string().contains('9'));
         assert_eq!(out, "Reopened 2\n");
         assert!(s.comments.iter().all(|c| c.closed.is_none()));
 
-        let blank = CommentsCmd::Close {
+        let blank = WorktreeCmd::Close {
             ids: vec![1],
             by: " ".into(),
         };
@@ -218,11 +331,91 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         let mut s = Store::load_from(Path::new("/wt"), Path::new("/r"), Some(path.clone()));
         assert!(run(&mut s, list(false, false)).0.is_err());
-        let close = CommentsCmd::Close {
+        let close = WorktreeCmd::Close {
             ids: vec![1],
             by: "a".into(),
         };
         assert!(run(&mut s, close).0.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    fn prune_args(yes: bool, deleted_repos: bool, age: Option<u64>) -> PruneArgs {
+        PruneArgs {
+            yes,
+            deleted_repos,
+            age,
+        }
+    }
+
+    fn run_prune(dir: &Path, entries: &[Entry], args: PruneArgs) -> (Result<()>, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = 10 * 86_400;
+        let res = prune(dir, entries, &args, now, &mut out, &mut err);
+        let s = |v: Vec<u8>| String::from_utf8(v).unwrap();
+        (res, s(out), s(err))
+    }
+
+    #[test]
+    fn prunes_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let entry = |name: &str, comments, gone, touched| {
+            let path = d.join(format!("{name}.json"));
+            std::fs::write(&path, "{}").unwrap();
+            Entry {
+                path,
+                worktree: format!("/wt/{name}").into(),
+                comments,
+                gone,
+                touched,
+            }
+        };
+        let entries = vec![
+            entry("removed", 2, Some(Gone::Worktree), 9 * 86_400),
+            entry("norepo", 1, Some(Gone::Repo), 9 * 86_400),
+            entry("listed", 1, Some(Gone::Listed), 9 * 86_400),
+            entry("old", 3, None, 0),
+        ];
+        let exists = |n: &str| d.join(format!("{n}.json")).exists();
+
+        // Listing only; skipped files are counted.
+        let (res, out, _) = run_prune(d, &entries, prune_args(false, false, None));
+        res.unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "Stale comment files in {}:\n    2 comments  /wt/removed  (worktree removed)\n\
+                 1 file of missing or unknown repositories skipped; add --deleted-repos to include them\n\
+                 1 file of missing worktrees their repository still lists skipped; if they were deleted, run `git worktree prune` there first\n\
+                 Run with --yes to delete them\n",
+                d.display()
+            )
+        );
+        assert!(exists("removed"));
+
+        // Opt-ins pick up more.
+        let (_, out, _) = run_prune(d, &entries, prune_args(false, true, Some(7)));
+        assert!(
+            out.contains("1 comment   /wt/norepo  (repository missing)"),
+            "{out}"
+        );
+        assert!(out.contains("/wt/old  (untouched for 10 days)"), "{out}");
+        assert!(!out.contains("/wt/listed  ("), "{out}");
+
+        // Deleting goes on after a failure and then fails.
+        std::fs::remove_file(d.join("norepo.json")).unwrap();
+        let (res, out, err) = run_prune(d, &entries, prune_args(true, true, None));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("1 file could not be removed")
+        );
+        assert!(err.starts_with(&format!("removing {}", d.join("norepo.json").display())));
+        assert!(out.ends_with("Removed 1 file\n"), "{out}");
+        assert!(!exists("removed") && exists("listed") && exists("old"));
+
+        let (res, out, _) = run_prune(d, &[], prune_args(true, false, None));
+        res.unwrap();
+        assert_eq!(out, format!("No stale comment files in {}\n", d.display()));
     }
 }
