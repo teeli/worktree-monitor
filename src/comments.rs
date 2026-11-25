@@ -43,6 +43,26 @@ pub struct Comment {
     /// Unix seconds.
     pub created: u64,
     pub updated: u64,
+    /// Set once the comment is handled (fixed or dropped); closed comments are hidden by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<Closed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Closed {
+    /// Unix seconds.
+    pub at: u64,
+    /// Who closed it: "user" from the TUI, else whatever `wtm comments close --by` was given.
+    pub by: String,
+}
+
+impl Closed {
+    pub fn now(by: &str) -> Self {
+        Closed {
+            at: now().0,
+            by: by.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +372,8 @@ pub struct Store {
     pub comments: Vec<Comment>,
     /// Why the file could not be read; it is never overwritten while this is set.
     pub error: Option<String>,
+    /// Modification time of the file when last read or written, to notice other writers.
+    mtime: Option<SystemTime>,
 }
 
 impl Store {
@@ -360,19 +382,43 @@ impl Store {
         Self::load_from(wt, repo, path)
     }
 
-    fn load_from(wt: &Path, repo: &Path, path: Option<PathBuf>) -> Self {
+    pub(crate) fn load_from(wt: &Path, repo: &Path, path: Option<PathBuf>) -> Self {
         let mut store = Store {
             wt: wt.to_path_buf(),
             repo: repo.to_path_buf(),
             path,
             comments: Vec::new(),
             error: None,
+            mtime: None,
         };
+        store.mtime = store.file_mtime();
         match store.read() {
             Ok(c) => store.comments = c,
             Err(e) => store.error = Some(format!("{e:#}")),
         }
         store
+    }
+
+    fn file_mtime(&self) -> Option<SystemTime> {
+        let path = self.path.as_ref()?;
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    /// Re-reads the file if something else (another instance, `wtm comments close`) wrote it
+    /// since. Returns whether the comments changed.
+    pub fn reload_if_changed(&mut self) -> bool {
+        let mtime = self.file_mtime();
+        if mtime == self.mtime {
+            return false;
+        }
+        self.mtime = mtime;
+        let (comments, error) = match self.read() {
+            Ok(c) => (c, None),
+            Err(e) => (self.comments.clone(), Some(format!("{e:#}"))),
+        };
+        let changed = comments != self.comments || error != self.error;
+        (self.comments, self.error) = (comments, error);
+        changed
     }
 
     fn read(&self) -> Result<Vec<Comment>> {
@@ -408,6 +454,7 @@ impl Store {
             comments,
         };
         self.comments = write(&path, file)?.comments;
+        self.mtime = self.file_mtime();
         Ok(())
     }
 
@@ -434,6 +481,17 @@ impl Store {
             }
         })?;
         Ok(found)
+    }
+
+    /// Closes (`Some`) or reopens (`None`) comment `id`; closing keeps an earlier close.
+    /// Returns whether the comment exists.
+    pub fn set_closed(&mut self, id: u64, closed: Option<Closed>) -> Result<bool> {
+        self.edit(id, |c| match closed {
+            Some(new) => {
+                c.closed.get_or_insert(new);
+            }
+            None => c.closed = None,
+        })
     }
 
     /// Moves working tree comments to the commits their lines were committed in.
@@ -497,9 +555,13 @@ pub struct Anchor {
 }
 
 impl Anchors {
-    /// Whether diff line `i` is covered by a range comment shown further down.
-    pub fn in_range(&self, i: usize) -> bool {
-        self.by_line.iter().any(|(&end, a)| a.start <= i && i < end)
+    /// The comment (index into `Store::comments`) of a range shown further down that covers
+    /// diff line `i`.
+    pub fn covering(&self, i: usize) -> Option<usize> {
+        self.by_line
+            .iter()
+            .find(|&(&end, a)| a.start <= i && i < end)
+            .map(|(_, a)| a.comment)
     }
 
     pub fn total(&self) -> usize {
@@ -509,9 +571,15 @@ impl Anchors {
 
 /// Indices of `comments` in display order: working tree first, then by commit in log order
 /// (`rank` gives a commit's position in the log), then commits not in the log by age; within
-/// each, by file and line.
-pub fn order(comments: &[Comment], rank: impl Fn(&str) -> Option<usize>) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..comments.len()).collect();
+/// each, by file and line. Closed comments are left out unless `include_closed`.
+pub fn order(
+    comments: &[Comment],
+    include_closed: bool,
+    rank: impl Fn(&str) -> Option<usize>,
+) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..comments.len())
+        .filter(|&i| include_closed || comments[i].closed.is_none())
+        .collect();
     idx.sort_by_cached_key(|&i| {
         let c = &comments[i];
         let group = match c.commit.as_deref() {
@@ -550,12 +618,20 @@ pub fn line_no(diff: &Diff, idx: usize, side: Side) -> Option<u32> {
 
 /// Places the comments for `file` (in `commit`, or the working tree) on diff lines: at their
 /// line if its text is unchanged, else on the nearest line with the same text. Range comments
-/// whose first line can't be found are shown as single-line comments.
-pub fn anchor(comments: &[Comment], diff: &Diff, file: &str, commit: Option<&str>) -> Anchors {
+/// whose first line can't be found are shown as single-line comments. Closed comments are
+/// left out unless `include_closed`.
+pub fn anchor(
+    comments: &[Comment],
+    include_closed: bool,
+    diff: &Diff,
+    file: &str,
+    commit: Option<&str>,
+) -> Anchors {
     let mine: Vec<(usize, LinePos)> = comments
         .iter()
         .enumerate()
         .filter(|(_, c)| c.file == file && c.commit.as_deref() == commit)
+        .filter(|(_, c)| include_closed || c.closed.is_none())
         .map(|(ci, c)| {
             let end = LinePos {
                 side: c.side,
@@ -632,6 +708,7 @@ mod tests {
             body: format!("c{id}"),
             created: 0,
             updated: 0,
+            closed: None,
         }
     }
 
@@ -659,10 +736,15 @@ mod tests {
             line: 1,
             text: "y".into(),
         });
+        c.closed = Some(Closed {
+            at: 1,
+            by: "user".into(),
+        });
         let json = serde_json::to_value(&c).unwrap();
         let defs = &schema["$defs"];
         assert_eq!(keys(&json), keys(&defs["comment"]["properties"]));
         assert_eq!(keys(&json["start"]), keys(&defs["linePos"]["properties"]));
+        assert_eq!(keys(&json["closed"]), keys(&defs["closed"]["properties"]));
         let file = CommentFile {
             schema: Some("x".into()),
             version: VERSION,
@@ -711,11 +793,48 @@ mod tests {
         assert_eq!((stored.body.as_str(), stored.line), ("patched", 4));
         assert!(!s.edit(99, |_| unreachable!()).unwrap());
 
+        // Closing keeps the first close; reopening clears it.
+        let first = Closed {
+            at: 5,
+            by: "claude".into(),
+        };
+        assert!(s.set_closed(2, Some(first.clone())).unwrap());
+        assert!(s.set_closed(2, Some(Closed::now("user"))).unwrap());
+        let stored = Store::load_from(wt, repo, Some(path.clone()));
+        assert_eq!(stored.comments[0].closed.as_ref(), Some(&first));
+        assert!(s.set_closed(2, None).unwrap());
+        assert!(s.comments[0].closed.is_none());
+        assert!(!s.set_closed(99, None).unwrap());
+
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, repo, Some(path.clone()));
         assert!(broken.error.is_some());
         assert!(broken.upsert(comment(3, Side::New, 1, "x", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn reloads_changes_from_other_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
+        let mut mine = Store::load_from(wt, repo, Some(path.clone()));
+        mine.upsert(comment(1, Side::New, 1, "a", None)).unwrap();
+        // Our own write is not a change.
+        assert!(!mine.reload_if_changed());
+        let mut other = Store::load_from(wt, repo, Some(path.clone()));
+        other.set_closed(1, Some(Closed::now("agent"))).unwrap();
+        // Make sure the mtime differs even on coarse-grained file systems.
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(mine.reload_if_changed());
+        assert!(mine.comments[0].closed.is_some());
+        assert!(!mine.reload_if_changed());
     }
 
     #[test]
@@ -733,9 +852,16 @@ mod tests {
         cs[4].created = 1;
         cs[6].file = "e".into();
         let log = ["new", "old"];
-        let o = order(&cs, |sha| log.iter().position(|s| *s == sha));
-        let ids: Vec<u64> = o.into_iter().map(|i| cs[i].id).collect();
-        assert_eq!(ids, vec![6, 3, 4, 7, 1, 5, 2]);
+        let ids = |cs: &[Comment], all| -> Vec<u64> {
+            order(cs, all, |sha| log.iter().position(|s| *s == sha))
+                .into_iter()
+                .map(|i| cs[i].id)
+                .collect()
+        };
+        assert_eq!(ids(&cs, false), vec![6, 3, 4, 7, 1, 5, 2]);
+        cs[3].closed = Some(Closed::now("user"));
+        assert_eq!(ids(&cs, false), vec![6, 3, 7, 1, 5, 2]);
+        assert_eq!(ids(&cs, true), vec![6, 3, 4, 7, 1, 5, 2]);
     }
 
     #[test]
@@ -1032,11 +1158,21 @@ mod tests {
             v.sort();
             v
         };
-        let a = anchor(&cs, &d, "f", None);
+        let a = anchor(&cs, false, &d, "f", None);
         assert_eq!(a.outdated, 1);
         assert_eq!(at(a), vec![(2, 1), (3, 0), (4, 2)]);
-        assert_eq!(at(anchor(&cs, &d, "f", Some("s"))), vec![(5, 4)]);
-        assert_eq!(anchor(&cs, &d, "other", None).total(), 0);
+        assert_eq!(at(anchor(&cs, false, &d, "f", Some("s"))), vec![(5, 4)]);
+        assert_eq!(anchor(&cs, false, &d, "other", None).total(), 0);
+        // Closed comments are only placed when asked for.
+        let mut cs = cs;
+        cs[0].closed = Some(Closed::now("user"));
+        cs[3].closed = Some(Closed::now("user"));
+        let a = anchor(&cs, false, &d, "f", None);
+        assert_eq!(a.outdated, 0);
+        assert_eq!(at(a), vec![(2, 1), (4, 2)]);
+        let a = anchor(&cs, true, &d, "f", None);
+        assert_eq!(a.outdated, 1);
+        assert_eq!(at(a), vec![(2, 1), (3, 0), (4, 2)]);
     }
 
     #[test]
@@ -1049,7 +1185,7 @@ mod tests {
             comment(1, Side::New, 4, "}", None),
             comment(2, Side::New, 3, "}", None),
         ];
-        let a = anchor(&cs, &d, "f", None);
+        let a = anchor(&cs, false, &d, "f", None);
         assert_eq!(a.by_line[&3].comment, 1);
         assert_eq!(a.by_line[&1].comment, 0);
     }
@@ -1067,7 +1203,7 @@ mod tests {
         drifted.start = Some(pos(3, "x"));
         let mut lost = comment(2, Side::New, 4, "c", None);
         lost.start = Some(pos(1, "gone"));
-        let a = anchor(&[drifted, lost], &d, "f", None);
+        let a = anchor(&[drifted, lost], false, &d, "f", None);
         assert_eq!(
             a.by_line[&3],
             Anchor {
@@ -1082,8 +1218,8 @@ mod tests {
                 start: 4
             }
         );
-        assert!(!a.in_range(1));
-        assert!(a.in_range(2));
-        assert!(!a.in_range(3));
+        assert_eq!(a.covering(1), None);
+        assert_eq!(a.covering(2), Some(0));
+        assert_eq!(a.covering(3), None);
     }
 }

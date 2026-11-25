@@ -62,6 +62,8 @@ pub enum Action {
     ToggleComments,
     NextComment,
     PrevComment,
+    CloseComment,
+    ToggleClosed,
     Escape,
 }
 
@@ -244,6 +246,20 @@ pub const BINDINGS: &[Binding] = &[
         "Jump to previous comment",
     ),
     b(
+        Comments,
+        &["x"],
+        A::CloseComment,
+        "x",
+        "Close / reopen comment (selected line, else pane highlight)",
+    ),
+    b(
+        Comments,
+        &["X"],
+        A::ToggleClosed,
+        "X",
+        "Show / hide closed comments",
+    ),
+    b(
         Tree,
         &["Enter", "Space"],
         A::Toggle,
@@ -356,6 +372,8 @@ mod tests {
         ));
         assert!(matches!(lookup("C-n"), Lookup::Action(Action::NextComment)));
         assert!(matches!(lookup("C-p"), Lookup::Action(Action::PrevComment)));
+        assert!(matches!(lookup("x"), Lookup::Action(Action::CloseComment)));
+        assert!(matches!(lookup("X"), Lookup::Action(Action::ToggleClosed)));
         assert!(matches!(lookup("Tab"), Lookup::None));
         assert!(matches!(lookup("E"), Lookup::None));
         assert!(matches!(lookup("3"), Lookup::Action(Action::Worktree(2))));

@@ -254,7 +254,9 @@ def main():
             ("c", 0.3),  # comment on the range
             ("Share one TokenStore with the routes instead of building it here", 0.3),
             ("\r", 0.3),  # save
-            ("C", 0.5),  # open the comments pane (shows toast)
+            ("x", 0.3),  # close it (as if fixed)
+            ("C", 0.3),  # open the comments pane
+            ("X", 0.5),  # show closed comments, dimmed (shows toast)
         ]
         screen = capture(binary, repo, base, keys)
     OUT.parent.mkdir(exist_ok=True)

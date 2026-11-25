@@ -23,6 +23,10 @@ commit history, side by side and updating in near-realtime.
   Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found
   in any commit since (e.g. the changes were discarded), it is marked *stale*. Comments on unchanged lines can't be
   traced to a commit and become stale as well.
+- **Closing comments.** `x` closes the comment on the selected line (or highlighted in the pane) once it is fixed or
+  dropped, and reopens a closed one. Closed comments are hidden; `X` shows them, dimmed. Each records when and by whom
+  it was closed; editing its text reopens it. Agents close comments with `wtm comments close` (see [below](#comments-from-the-command-line)), and
+  the running app picks up the change within seconds.
 - **Copy the file path to the clipboard,** with `:line` (or `:start-end`) appended when diff lines are selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
   when file watching is unavailable). Adding or removing worktrees updates
@@ -82,6 +86,21 @@ one without `git worktree remove`, run `git worktree prune` first.
 includes files from older versions of `wtm` that didn't record their repository. `--age` applies to every file,
 including those of existing worktrees.
 
+### Comments from the command line
+
+`wtm comments` reads and closes the comments of the worktree it is run in, e.g. by an AI agent that has handled
+review comments:
+
+```sh
+wtm comments list                     # open comments: id, file:line, commit, body
+wtm comments list --all --json        # include closed ones, as JSON (schema/comments.schema.json, ids as strings)
+wtm comments close <ID>... --by NAME  # close fixed or dropped comments (--by defaults to "agent")
+wtm comments reopen <ID>...
+```
+
+It finds the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
+represent exactly, so `--json` prints them as strings. Editing a closed comment's text reopens it.
+
 ## Keys
 
 Press `?` in the app for the full list.
@@ -103,6 +122,8 @@ Press `?` in the app for the full list.
 | Comments | `c` | Comment on the selected line (edit if it has one; save empty to delete) |
 | | `C` | Toggle the comments pane |
 | | `Ctrl-n` / `Ctrl-p` | Jump to next / previous comment (switching commit and file as needed) |
+| | `x` | Close / reopen the comment on the selected line (else the one highlighted in the pane) |
+| | `X` | Show / hide closed comments |
 | File tree | `Enter` / `Space` | Toggle directory (of the current file) |
 | | `H` / `Shift-←` | Collapse directory and all subdirectories |
 | | `L` / `Shift-→` | Expand directory and all subdirectories |

@@ -1,7 +1,7 @@
 //! Application state, event handling and actions.
 
 use crate::clipboard::Clipboard;
-use crate::comments::{self, Anchors, Comment, LinePos, Side, Store};
+use crate::comments::{self, Anchors, Closed, Comment, LinePos, Side, Store};
 use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::input::{LineInput, Outcome};
@@ -115,6 +115,8 @@ pub struct WtState {
     resolve_sent: Option<(String, Vec<u64>)>,
     /// Working tree comments whose lines were found in no commit.
     stale: HashSet<u64>,
+    /// Show closed comments (mirrors `App::show_closed`).
+    pub show_closed: bool,
 }
 
 impl WtState {
@@ -162,6 +164,7 @@ impl WtState {
             resolved: HashMap::new(),
             resolve_sent: None,
             stale: HashSet::new(),
+            show_closed: false,
         }
     }
 
@@ -219,6 +222,7 @@ impl WtState {
         self.anchors = match &self.file {
             Some(f) => comments::anchor(
                 &self.comments.comments,
+                self.show_closed,
                 &self.diff,
                 &f.path,
                 self.commit.as_ref().map(|c| c.sha.as_str()),
@@ -229,7 +233,7 @@ impl WtState {
 
     /// Indices into `comments.comments` in pane and navigation order.
     pub fn comment_order(&self) -> Vec<usize> {
-        comments::order(&self.comments.comments, |sha| {
+        comments::order(&self.comments.comments, self.show_closed, |sha| {
             self.commits.iter().position(|c| c.sha == sha)
         })
     }
@@ -360,6 +364,8 @@ pub struct App {
     pub wrap: bool,
     /// Show the comments pane (when the terminal is wide enough).
     pub comments_pane: bool,
+    /// Show closed comments, dimmed.
+    pub show_closed: bool,
     pub help_scroll: usize,
     pub toast: Option<(String, bool, Instant)>,
     pub hit: HitAreas,
@@ -403,6 +409,7 @@ impl App {
             help: false,
             wrap: false,
             comments_pane: false,
+            show_closed: false,
             help_scroll: 0,
             toast: None,
             hit: HitAreas::default(),
@@ -590,6 +597,7 @@ impl App {
             }
             AppEvent::Tick => {
                 self.ticks += 1;
+                self.reload_comments();
                 if self.watcher.is_some() {
                     if self.ticks.is_multiple_of(FALLBACK_TICKS) {
                         self.refresh_all();
@@ -914,7 +922,9 @@ impl App {
                 }
                 None => {
                     added.push(self.wts.len());
-                    self.wts.push(WtState::new(info, &self.common_canon));
+                    let mut st = WtState::new(info, &self.common_canon);
+                    st.show_closed = self.show_closed;
+                    self.wts.push(st);
                 }
             }
         }
@@ -1144,6 +1154,20 @@ impl App {
             }
             Action::NextComment | Action::PrevComment => {
                 self.step_comment(action == Action::NextComment)
+            }
+            Action::CloseComment => self.toggle_closed_comment(),
+            Action::ToggleClosed => {
+                self.show_closed = !self.show_closed;
+                for st in &mut self.wts {
+                    st.show_closed = self.show_closed;
+                    st.reanchor();
+                }
+                let msg = if self.show_closed {
+                    "Showing closed comments"
+                } else {
+                    "Hiding closed comments"
+                };
+                self.notify(msg.into(), false);
             }
             Action::Escape => {
                 if let Some(st) = self.wts.get_mut(self.active) {
@@ -1400,6 +1424,64 @@ impl App {
         }
     }
 
+    /// Picks up comment changes written by others, e.g. `wtm comments close` run by an agent.
+    fn reload_comments(&mut self) {
+        let mut errors = Vec::new();
+        for st in &mut self.wts {
+            let had_error = st.comments.error.is_some();
+            if st.comments.reload_if_changed() {
+                st.reanchor();
+                self.dirty = true;
+                if let Some(e) = st.comments.error.as_ref().filter(|_| !had_error) {
+                    errors.push(format!("Comments unreadable: {e}"));
+                }
+            }
+        }
+        for e in errors {
+            self.notify(e, true);
+        }
+    }
+
+    /// Closes or reopens the comment on the selected diff line, else the one highlighted in
+    /// the comments pane.
+    fn toggle_closed_comment(&mut self) {
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        let on_line = st
+            .diff_sel
+            .and_then(|s| st.anchors.by_line.get(&s))
+            .and_then(|a| st.comments.comments.get(a.comment));
+        let visible = |c: &&Comment| st.show_closed || c.closed.is_none();
+        let target = on_line.or_else(|| {
+            let id = st.comment_sel?;
+            st.comments
+                .comments
+                .iter()
+                .find(|c| c.id == id)
+                .filter(visible)
+        });
+        let Some(c) = target else {
+            self.notify("Select a commented line or a comment to close".into(), true);
+            return;
+        };
+        let (id, close) = (c.id, c.closed.is_none());
+        let res = st
+            .comments
+            .set_closed(id, close.then(|| Closed::now("user")));
+        if close && !st.show_closed && st.comment_sel == Some(id) {
+            st.comment_sel = None;
+        }
+        st.reanchor();
+        let msg = match res {
+            Ok(true) if close => "Comment closed",
+            Ok(true) => "Comment reopened",
+            Ok(false) => "Comment was deleted elsewhere",
+            Err(e) => return self.notify(format!("Closing comment failed: {e:#}"), true),
+        };
+        self.notify(msg.into(), false);
+    }
+
     /// Jumps to the comment after/before the highlighted one in pane order.
     fn step_comment(&mut self, forward: bool) {
         let Some(st) = self.active() else { return };
@@ -1572,6 +1654,7 @@ impl App {
                     body: String::new(),
                     created: secs,
                     updated: secs,
+                    closed: None,
                 };
                 (comment, false)
             }
@@ -1607,6 +1690,10 @@ impl App {
                 // Only what the input changed: the comment may have been moved to a commit
                 // (or edited by another instance) meanwhile.
                 st.comments.edit(id, |s| {
+                    // New text is new feedback: it reopens a closed comment.
+                    if s.body != c.body {
+                        s.closed = None;
+                    }
                     s.body = c.body;
                     s.updated = c.updated;
                     if s.commit == c.commit {

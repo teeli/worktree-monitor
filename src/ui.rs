@@ -472,10 +472,14 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         let being_written = input.is_some_and(|inp| inp.at == i || selected && i < inp.at);
         let mark = if being_written {
             Some(theme.popup_border)
-        } else if note.is_some() || st.anchors.in_range(i) {
-            Some(theme.comment)
         } else {
-            None
+            match (&note, st.anchors.covering(i)) {
+                (Some(n), _) if n.closed => Some(theme.dim),
+                (Some(_), _) => Some(theme.comment),
+                (None, Some(ci)) if is_closed(st, ci) => Some(theme.dim),
+                (None, Some(_)) => Some(theme.comment),
+                (None, None) => None,
+            }
         };
         let chunks = if wrap {
             wrap_ranges(&l.text, text_w)
@@ -497,6 +501,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         let editing = note.cursor.is_some();
         let frame = if editing {
             theme.popup_border
+        } else if note.closed {
+            theme.dim
         } else {
             theme.comment
         };
@@ -518,6 +524,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let style = if editing {
                 theme.base
+            } else if note.closed {
+                theme.dim
             } else {
                 theme.comment_text
             };
@@ -562,6 +570,8 @@ struct Note<'a> {
     text: &'a str,
     /// Byte offset of the input cursor while editing.
     cursor: Option<usize>,
+    /// A closed comment, shown dimmed.
+    closed: bool,
 }
 
 impl<'a> Note<'a> {
@@ -596,13 +606,26 @@ fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Op
         return Some(Note {
             text: &e.text,
             cursor: Some(cursor),
+            closed: false,
         });
     }
-    let ci = st.anchors.by_line.get(&i)?;
+    let c = st
+        .comments
+        .comments
+        .get(st.anchors.by_line.get(&i)?.comment)?;
     Some(Note {
-        text: &st.comments.comments.get(ci.comment)?.body,
+        text: &c.body,
         cursor: None,
+        closed: c.closed.is_some(),
     })
+}
+
+/// Whether `st.comments.comments[ci]` is closed.
+fn is_closed(st: &WtState, ci: usize) -> bool {
+    st.comments
+        .comments
+        .get(ci)
+        .is_some_and(|c| c.closed.is_some())
 }
 
 /// Screen rows of diff line `i`: the line itself (wrapped or not) and the note below it.
@@ -717,12 +740,12 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
         return message(f, inner, err, theme.error);
     }
     if order.is_empty() {
-        return message(
-            f,
-            inner,
-            "No comments. Press c on a diff line to add one.",
-            theme.dim,
-        );
+        let text = if st.comments.comments.is_empty() || st.show_closed {
+            "No comments. Press c on a diff line to add one."
+        } else {
+            "No open comments. X shows closed ones."
+        };
+        return message(f, inner, text, theme.dim);
     }
     let h = inner.height as usize;
     let w = inner.width as usize;
@@ -777,17 +800,26 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             },
         };
-        let budget = w.saturating_sub(lines.width() + tag.width()).max(8);
+        let closed = if c.closed.is_some() { " · closed" } else { "" };
+        let (file_style, bar_style, body_style) = if c.closed.is_some() {
+            (theme.dim, theme.dim, theme.dim)
+        } else {
+            (theme.base, theme.comment, theme.comment_text)
+        };
+        let budget = w
+            .saturating_sub(lines.width() + tag.width() + closed.width())
+            .max(8);
         let header = vec![
-            Span::styled(shorten_left(&c.file, budget), theme.base),
+            Span::styled(shorten_left(&c.file, budget), file_style),
             Span::styled(lines, theme.dim),
             Span::styled(tag, tag_style),
+            Span::styled(closed, theme.dim),
         ];
         let mut rows = vec![fit_spans(header, w)];
         for text in wrap_ranges(&c.body, w.saturating_sub(2)) {
             let spans = vec![
-                Span::styled("│ ", theme.comment),
-                Span::styled(text.to_string(), theme.comment_text),
+                Span::styled("│ ", bar_style),
+                Span::styled(text.to_string(), body_style),
             ];
             rows.push(fit_spans(spans, w));
         }
@@ -1098,6 +1130,7 @@ mod tests {
         let note = |text, cursor| Note {
             text,
             cursor: Some(cursor),
+            closed: false,
         };
         // Width 7 → 5 columns of note text after the bar.
         let n = note("abcd efgh", 5);
