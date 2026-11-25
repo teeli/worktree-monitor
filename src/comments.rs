@@ -58,6 +58,9 @@ struct CommentFile {
     schema: Option<String>,
     version: u32,
     worktree: PathBuf,
+    /// Canonical git common dir of the worktree's repository; missing in files from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo: Option<PathBuf>,
     comments: Vec<Comment>,
 }
 
@@ -70,6 +73,10 @@ pub fn state_dir() -> Option<PathBuf> {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
     })?;
     Some(base.join("wtm"))
+}
+
+fn comments_dir() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("comments"))
 }
 
 /// File name for a worktree's comments: the path with `%` doubled and `/` as `%` (like vim's undodir).
@@ -101,6 +108,74 @@ fn write_schema(dir: &Path) -> Result<String> {
     Ok(file_url(&path))
 }
 
+/// Atomically writes `file` to `path`, with the schema next to the comments directory.
+fn write(path: &Path, mut file: CommentFile) -> Result<CommentFile> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // The schema lives in the state directory, one level above the comment files.
+    file.schema = Some(write_schema(dir.parent().unwrap_or(dir))?);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(file)
+}
+
+/// Deletes the comment files of `repo`'s worktrees that are no longer in `live`, returning how
+/// many and the first error. Files from older versions without a repo are tagged if their
+/// worktree is live. A failing file doesn't stop the others.
+pub fn prune(repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
+    match comments_dir() {
+        Some(dir) => prune_in(&dir, repo, live),
+        None => (0, None),
+    }
+}
+
+fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::Error>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, None),
+        Err(e) => {
+            return (
+                0,
+                Some(anyhow!(e).context(format!("reading {}", dir.display()))),
+            );
+        }
+    };
+    let mut removed = 0;
+    let mut error = None;
+    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        // Files that can't be read are left alone, like `Store` never overwrites them.
+        let Some(mut file) = std::fs::read(&path)
+            .ok()
+            .and_then(|d| serde_json::from_slice::<CommentFile>(&d).ok())
+        else {
+            continue;
+        };
+        if path.file_name() != Some(file_name(&file.worktree).as_ref()) {
+            continue;
+        }
+        let is_live = live.contains(&file.worktree.as_path());
+        let res = match &file.repo {
+            Some(r) if r == repo && !is_live => std::fs::remove_file(&path)
+                .map(|()| removed += 1)
+                .with_context(|| format!("removing {}", path.display())),
+            None if is_live => {
+                file.repo = Some(repo.to_path_buf());
+                write(&path, file).map(drop)
+            }
+            _ => Ok(()),
+        };
+        if let Err(e) = res {
+            error.get_or_insert(e);
+        }
+    }
+    (removed, error)
+}
+
 pub fn now() -> (u64, u64) {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -111,6 +186,8 @@ pub fn now() -> (u64, u64) {
 pub struct Store {
     /// Canonical worktree path.
     wt: PathBuf,
+    /// Canonical git common dir of the repository.
+    repo: PathBuf,
     /// `None` when no state directory could be determined.
     path: Option<PathBuf>,
     pub comments: Vec<Comment>,
@@ -119,14 +196,15 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn load(wt: &Path) -> Self {
-        let path = state_dir().map(|d| d.join("comments").join(file_name(wt)));
-        Self::load_from(wt, path)
+    pub fn load(wt: &Path, repo: &Path) -> Self {
+        let path = comments_dir().map(|d| d.join(file_name(wt)));
+        Self::load_from(wt, repo, path)
     }
 
-    fn load_from(wt: &Path, path: Option<PathBuf>) -> Self {
+    fn load_from(wt: &Path, repo: &Path, path: Option<PathBuf>) -> Self {
         let mut store = Store {
             wt: wt.to_path_buf(),
+            repo: repo.to_path_buf(),
             path,
             comments: Vec::new(),
             error: None,
@@ -163,21 +241,14 @@ impl Store {
             .inspect_err(|e| self.error = Some(format!("{e:#}")))?;
         self.error = None;
         f(&mut comments);
-        let dir = path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        // The schema lives in the state directory, one level above the comment files.
-        let schema = write_schema(dir.parent().unwrap_or(dir))?;
         let file = CommentFile {
-            schema: Some(schema),
+            schema: None,
             version: VERSION,
             worktree: self.wt.clone(),
+            repo: Some(self.repo.clone()),
             comments,
         };
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-        self.comments = file.comments;
+        self.comments = write(&path, file)?.comments;
         Ok(())
     }
 
@@ -437,6 +508,7 @@ mod tests {
             schema: Some("x".into()),
             version: VERSION,
             worktree: "/wt".into(),
+            repo: Some("/repo".into()),
             comments: vec![],
         };
         let json = serde_json::to_value(&file).unwrap();
@@ -449,7 +521,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("comments").join("wt.json");
         let wt = Path::new("/wt");
-        let mut s = Store::load_from(wt, Some(path.clone()));
+        let repo = Path::new("/repo/.git");
+        let mut s = Store::load_from(wt, repo, Some(path.clone()));
         assert!(s.comments.is_empty() && s.error.is_none());
         s.upsert(comment(1, Side::New, 3, "a", None)).unwrap();
         let schema = dir.path().join(SCHEMA_FILE);
@@ -457,16 +530,17 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["$schema"], file_url(&schema));
+        assert_eq!(written["repo"], "/repo/.git");
         let mut c = comment(2, Side::Old, 4, "b", Some("abc"));
         s.upsert(c.clone()).unwrap();
         c.body = "edited".into();
         s.upsert(c.clone()).unwrap();
-        let s2 = Store::load_from(wt, Some(path.clone()));
+        let s2 = Store::load_from(wt, repo, Some(path.clone()));
         assert_eq!(s2.comments.len(), 2);
         assert_eq!(s2.comments[1], c);
         s.remove(1).unwrap();
         assert_eq!(
-            Store::load_from(wt, Some(path.clone())).comments,
+            Store::load_from(wt, repo, Some(path.clone())).comments,
             vec![c.clone()]
         );
         // Only working tree comments move.
@@ -474,12 +548,12 @@ mod tests {
         assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
         // Edits touch only the given comment, and only what `f` changes.
         assert!(s.edit(2, |c| c.body = "patched".into()).unwrap());
-        let stored = &Store::load_from(wt, Some(path.clone())).comments[0];
+        let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
         assert_eq!((stored.body.as_str(), stored.line), ("patched", 4));
         assert!(!s.edit(99, |_| unreachable!()).unwrap());
 
         std::fs::write(&path, "not json").unwrap();
-        let mut broken = Store::load_from(wt, Some(path.clone()));
+        let mut broken = Store::load_from(wt, repo, Some(path.clone()));
         assert!(broken.error.is_some());
         assert!(broken.upsert(comment(3, Side::New, 1, "x", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
@@ -550,6 +624,67 @@ mod tests {
         assert_eq!(step(3, Some(0), false), None);
         assert_eq!(step(0, None, true), None);
         assert_eq!(step(0, None, false), None);
+    }
+
+    #[test]
+    fn prunes_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Path::new("/repo/.git");
+        let put = |wt: &str, repo: Option<&str>| {
+            let path = dir.path().join(file_name(Path::new(wt)));
+            let mut json = serde_json::json!({"version": 1, "worktree": wt, "comments": []});
+            if let Some(r) = repo {
+                json["repo"] = r.into();
+            }
+            std::fs::write(&path, json.to_string()).unwrap();
+            path
+        };
+        let live = put("/live", Some("/repo/.git"));
+        let dead = put("/dead", Some("/repo/.git"));
+        let other = put("/other", Some("/elsewhere/.git"));
+        let legacy_live = put("/legacy-live", None);
+        let legacy_dead = put("/legacy-dead", None);
+        let broken = dir.path().join("%broken.json");
+        std::fs::write(&broken, "not json").unwrap();
+        let renamed = dir.path().join("renamed.json");
+        std::fs::copy(&dead, &renamed).unwrap();
+
+        let wts = [Path::new("/live"), Path::new("/legacy-live")];
+        let (removed, error) = prune_in(dir.path(), repo, &wts);
+        assert_eq!(removed, 1);
+        assert!(error.is_none());
+        assert!(!dead.exists());
+        for p in [&live, &other, &legacy_live, &legacy_dead, &broken, &renamed] {
+            assert!(p.exists(), "{} was removed", p.display());
+        }
+        let tagged: CommentFile =
+            serde_json::from_slice(&std::fs::read(&legacy_live).unwrap()).unwrap();
+        assert_eq!(tagged.repo.as_deref(), Some(repo));
+        let (removed, error) = prune_in(&dir.path().join("missing"), repo, &wts);
+        assert_eq!(removed, 0);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn prune_continues_after_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |wt: &str, repo: Option<&str>| {
+            let path = dir.path().join(file_name(Path::new(wt)));
+            let mut json = serde_json::json!({"version": 1, "worktree": wt, "comments": []});
+            if let Some(r) = repo {
+                json["repo"] = r.into();
+            }
+            std::fs::write(&path, json.to_string()).unwrap();
+            path
+        };
+        // Tagging this one fails: its temp file path is taken by a directory.
+        let stuck = put("/live", None);
+        std::fs::create_dir(stuck.with_extension("json.tmp")).unwrap();
+        let dead = put("/dead", Some("/repo/.git"));
+        let (removed, error) = prune_in(dir.path(), Path::new("/repo/.git"), &[Path::new("/live")]);
+        assert_eq!(removed, 1);
+        assert!(!dead.exists());
+        assert!(error.is_some());
     }
 
     #[test]

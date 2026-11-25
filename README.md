@@ -16,7 +16,8 @@ commit history, side by side and updating in near-realtime.
   note right below it. Comments are tied to the file, lines and viewed commit, follow their lines when the file
   changes, and are marked by a bar in the gutter. They are stored as JSON per worktree in `$XDG_STATE_HOME/wtm`
   (default `~/.local/state/wtm`); the format is described by [`schema/comments.schema.json`](schema/comments.schema.json),
-  a copy of which is written next to the files and linked from their `$schema`.
+  a copy of which is written next to the files and linked from their `$schema`. Files of removed worktrees are
+  deleted on startup.
 - **Comments pane** (`C`) on the right lists every comment of the worktree, working tree and commits alike.
   `Ctrl-n` / `Ctrl-p` (or a click on an entry) jump to a comment, switching to its commit, file and line.
   Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found

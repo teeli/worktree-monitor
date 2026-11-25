@@ -118,10 +118,10 @@ pub struct WtState {
 }
 
 impl WtState {
-    fn new(info: Worktree) -> Self {
+    fn new(info: Worktree, repo: &Path) -> Self {
         let canon = std::fs::canonicalize(&info.path).unwrap_or_else(|_| info.path.clone());
         let gitdir = resolve_gitdir(&info.path);
-        let comments = Store::load(&canon);
+        let comments = Store::load(&canon, repo);
         WtState {
             info,
             canon,
@@ -388,10 +388,13 @@ impl App {
     ) -> Result<Self> {
         let infos = git::list_worktrees(&repo.toplevel)?;
         let top = std::fs::canonicalize(&repo.toplevel).unwrap_or_else(|_| repo.toplevel.clone());
-        let wts: Vec<WtState> = infos.into_iter().map(WtState::new).collect();
-        let active = wts.iter().position(|w| w.canon == top).unwrap_or(0);
         let common_canon =
             std::fs::canonicalize(&repo.common_dir).unwrap_or_else(|_| repo.common_dir.clone());
+        let wts: Vec<WtState> = infos
+            .into_iter()
+            .map(|i| WtState::new(i, &common_canon))
+            .collect();
+        let active = wts.iter().position(|w| w.canon == top).unwrap_or(0);
         let mut app = App {
             repo,
             theme,
@@ -416,6 +419,19 @@ impl App {
             next_id: 1,
             clipboard: Clipboard::default(),
         };
+        // A registered worktree whose directory is missing (e.g. on an unmounted volume) has no
+        // canonical path to match its comment file by; wait until git prunes it.
+        if app.wts.iter().all(|w| w.info.exists()) {
+            let live: Vec<&Path> = app.wts.iter().map(|w| w.canon.as_path()).collect();
+            let (removed, error) = comments::prune(&app.common_canon, &live);
+            if removed > 0 {
+                let s = if removed == 1 { "" } else { "s" };
+                app.notify(format!("Removed {removed} stale comment file{s}"), false);
+            }
+            if let Some(e) = error {
+                app.notify(format!("Cleaning up comments failed: {e:#}"), true);
+            }
+        }
         if let Some(e) = app.wts.iter().find_map(|w| w.comments.error.clone()) {
             app.notify(format!("Comments unreadable: {e}"), true);
         }
@@ -898,7 +914,7 @@ impl App {
                 }
                 None => {
                     added.push(self.wts.len());
-                    self.wts.push(WtState::new(info));
+                    self.wts.push(WtState::new(info, &self.common_canon));
                 }
             }
         }

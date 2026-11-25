@@ -19,6 +19,10 @@
       "description": "Canonical path of the worktree.",
       "type": "string"
     },
+    "repo": {
+      "description": "Canonical git common directory of the repository the worktree belongs to; files of its removed worktrees are deleted on startup.",
+      "type": "string"
+    },
     "comments": {
       "type": "array",
       "items": { "$ref": "#/$defs/comment" }
