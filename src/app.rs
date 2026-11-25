@@ -1,7 +1,7 @@
 //! Application state, event handling and actions.
 
 use crate::clipboard::Clipboard;
-use crate::comments::{self, Anchors, Comment, LinePos, Side, Store};
+use crate::comments::{self, Anchors, Closed, Comment, LinePos, Side, Store};
 use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::input::{LineInput, Outcome};
@@ -215,10 +215,12 @@ impl WtState {
         self.anchors = Anchors::default();
     }
 
-    fn reanchor(&mut self) {
+    /// Places the shown diff's comments; closed ones only when `show_closed`.
+    fn reanchor(&mut self, show_closed: bool) {
         self.anchors = match &self.file {
             Some(f) => comments::anchor(
                 &self.comments.comments,
+                show_closed,
                 &self.diff,
                 &f.path,
                 self.commit.as_ref().map(|c| c.sha.as_str()),
@@ -227,9 +229,10 @@ impl WtState {
         };
     }
 
-    /// Indices into `comments.comments` in pane and navigation order.
-    pub fn comment_order(&self) -> Vec<usize> {
-        comments::order(&self.comments.comments, |sha| {
+    /// Indices into `comments.comments` in pane and navigation order; closed ones only when
+    /// `show_closed`.
+    pub fn comment_order(&self, show_closed: bool) -> Vec<usize> {
+        comments::order(&self.comments.comments, show_closed, |sha| {
             self.commits.iter().position(|c| c.sha == sha)
         })
     }
@@ -242,6 +245,20 @@ impl WtState {
 
     fn changed(&self, file: &str) -> bool {
         self.changes.iter().any(|f| f.path == file)
+    }
+
+    /// Clears the pane highlight if its comment is no longer listed (deleted, or closed and
+    /// hidden), so `x` and comment navigation don't act on an invisible comment.
+    fn drop_hidden_sel(&mut self, show_closed: bool) {
+        let Some(id) = self.comment_sel else { return };
+        let all = &self.comments.comments;
+        if !self
+            .comment_order(show_closed)
+            .iter()
+            .any(|&ci| all[ci].id == id)
+        {
+            self.comment_sel = None;
+        }
     }
 
     fn select_comment(&mut self, id: Option<u64>) {
@@ -360,6 +377,8 @@ pub struct App {
     pub wrap: bool,
     /// Show the comments pane (when the terminal is wide enough).
     pub comments_pane: bool,
+    /// Show closed comments, dimmed.
+    pub show_closed: bool,
     pub help_scroll: usize,
     pub toast: Option<(String, bool, Instant)>,
     pub hit: HitAreas,
@@ -403,6 +422,7 @@ impl App {
             help: false,
             wrap: false,
             comments_pane: false,
+            show_closed: false,
             help_scroll: 0,
             toast: None,
             hit: HitAreas::default(),
@@ -590,6 +610,7 @@ impl App {
             }
             AppEvent::Tick => {
                 self.ticks += 1;
+                self.reload_comments();
                 if self.watcher.is_some() {
                     if self.ticks.is_multiple_of(FALLBACK_TICKS) {
                         self.refresh_all();
@@ -772,7 +793,7 @@ impl App {
                             st.diff_sel = st.diff_sel.map(|s| s.min(last));
                             st.diff_anchor = st.diff_anchor.map(|s| s.min(last));
                             st.diff_offset = st.diff_offset.min(last);
-                            st.reanchor();
+                            st.reanchor(self.show_closed);
                         }
                         if let Some(msg) = st.apply_jump(height) {
                             self.notify(msg.into(), true);
@@ -808,7 +829,7 @@ impl App {
                     return;
                 }
                 let res = st.comments.move_to_commits(&moves);
-                st.reanchor();
+                st.reanchor(self.show_closed);
                 match res {
                     Ok(()) => {
                         let n = moves.len();
@@ -1145,6 +1166,20 @@ impl App {
             Action::NextComment | Action::PrevComment => {
                 self.step_comment(action == Action::NextComment)
             }
+            Action::CloseComment => self.toggle_closed_comment(),
+            Action::ToggleClosed => {
+                self.show_closed = !self.show_closed;
+                for st in &mut self.wts {
+                    st.reanchor(self.show_closed);
+                    st.drop_hidden_sel(self.show_closed);
+                }
+                let msg = if self.show_closed {
+                    "Showing closed comments"
+                } else {
+                    "Hiding closed comments"
+                };
+                self.notify(msg.into(), false);
+            }
             Action::Escape => {
                 if let Some(st) = self.wts.get_mut(self.active) {
                     st.diff_sel = None;
@@ -1400,10 +1435,72 @@ impl App {
         }
     }
 
+    /// Picks up comment changes written by others, e.g. `wtm comments close` run by an agent.
+    fn reload_comments(&mut self) {
+        let mut errors = Vec::new();
+        for st in &mut self.wts {
+            let had_error = st.comments.error.is_some();
+            if st.comments.reload_if_changed() {
+                st.reanchor(self.show_closed);
+                st.drop_hidden_sel(self.show_closed);
+                self.dirty = true;
+                if let Some(e) = st.comments.error.as_ref().filter(|_| !had_error) {
+                    errors.push(format!("Comments unreadable: {e}"));
+                }
+            }
+        }
+        for e in errors {
+            self.notify(e, true);
+        }
+    }
+
+    /// Closes or reopens the comment on the selected diff line, else the one highlighted in
+    /// the comments pane.
+    fn toggle_closed_comment(&mut self) {
+        let show_closed = self.show_closed;
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        // The comment shown below the line, else one whose range covers it.
+        let on_line = st
+            .diff_sel
+            .and_then(|s| {
+                let below = st.anchors.by_line.get(&s).map(|a| a.comment);
+                below.or_else(|| st.anchors.covering(s))
+            })
+            .and_then(|ci| st.comments.comments.get(ci));
+        let visible = |c: &&Comment| show_closed || c.closed.is_none();
+        let target = on_line.or_else(|| {
+            let id = st.comment_sel?;
+            st.comments
+                .comments
+                .iter()
+                .find(|c| c.id == id)
+                .filter(visible)
+        });
+        let Some(c) = target else {
+            self.notify("Select a commented line or a comment to close".into(), true);
+            return;
+        };
+        let (id, close) = (c.id, c.closed.is_none());
+        let res = st
+            .comments
+            .set_closed(id, close.then(|| Closed::now("user")));
+        st.reanchor(show_closed);
+        st.drop_hidden_sel(show_closed);
+        let msg = match res {
+            Ok(true) if close => "Comment closed",
+            Ok(true) => "Comment reopened",
+            Ok(false) => "Comment was deleted elsewhere",
+            Err(e) => return self.notify(format!("Closing comment failed: {e:#}"), true),
+        };
+        self.notify(msg.into(), false);
+    }
+
     /// Jumps to the comment after/before the highlighted one in pane order.
     fn step_comment(&mut self, forward: bool) {
         let Some(st) = self.active() else { return };
-        let order = st.comment_order();
+        let order = st.comment_order(self.show_closed);
         let all = &st.comments.comments;
         let cur = st
             .comment_sel
@@ -1572,6 +1669,7 @@ impl App {
                     body: String::new(),
                     created: secs,
                     updated: secs,
+                    closed: None,
                 };
                 (comment, false)
             }
@@ -1607,6 +1705,10 @@ impl App {
                 // Only what the input changed: the comment may have been moved to a commit
                 // (or edited by another instance) meanwhile.
                 st.comments.edit(id, |s| {
+                    // New text is new feedback: it reopens a closed comment.
+                    if s.body != c.body {
+                        s.closed = None;
+                    }
                     s.body = c.body;
                     s.updated = c.updated;
                     if s.commit == c.commit {
@@ -1626,7 +1728,7 @@ impl App {
                 Err(e) => Err(e),
             }
         };
-        st.reanchor();
+        st.reanchor(self.show_closed);
         match res {
             Ok(msg) => self.notify(msg.into(), false),
             Err(e) => self.notify(format!("Saving comment failed: {e:#}"), true),
@@ -1688,7 +1790,9 @@ impl App {
                         }
                     }
                     Pane::Comments => {
-                        if let Some(id) = crate::ui::comment_at_row(st, rel, rect.width) {
+                        if let Some(id) =
+                            crate::ui::comment_at_row(st, self.show_closed, rel, rect.width)
+                        {
                             self.jump_to_comment(id);
                         }
                     }

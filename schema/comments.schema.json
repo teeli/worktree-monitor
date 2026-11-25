@@ -87,7 +87,24 @@
         },
         "body": { "type": "string", "minLength": 1 },
         "created": { "$ref": "#/$defs/unixTime" },
-        "updated": { "$ref": "#/$defs/unixTime" }
+        "updated": { "$ref": "#/$defs/unixTime" },
+        "closed": {
+          "description": "Set once the comment is handled (fixed or dropped); absent while it is open.",
+          "$ref": "#/$defs/closed"
+        }
+      }
+    },
+    "closed": {
+      "type": "object",
+      "required": ["at", "by"],
+      "additionalProperties": false,
+      "properties": {
+        "at": { "description": "When the comment was closed.", "$ref": "#/$defs/unixTime" },
+        "by": {
+          "description": "Who closed it: \"user\" from the TUI, else the name given to `wtm comments close --by` (e.g. an agent's).",
+          "type": "string",
+          "minLength": 1
+        }
       }
     }
   }

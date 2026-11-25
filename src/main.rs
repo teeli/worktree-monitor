@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod clipboard;
 mod comments;
 mod diff;
@@ -51,6 +52,8 @@ enum Command {
         #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u64).range(1..))]
         age: Option<u64>,
     },
+    #[command(flatten)]
+    Cli(cli::Command),
 }
 
 fn main() -> Result<()> {
@@ -62,6 +65,9 @@ fn main() -> Result<()> {
     }) = args.command
     {
         return prune(yes, deleted_repos, age);
+    }
+    if let Some(Command::Cli(cmd)) = args.command {
+        return cli::run(cmd);
     }
     let repo = git::discover(&std::env::current_dir()?)?;
 
