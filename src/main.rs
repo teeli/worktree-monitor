@@ -48,7 +48,7 @@ enum Command {
         deleted_repos: bool,
         /// Also include files whose comments weren't added or edited in this many days, even
         /// if their worktree still exists.
-        #[arg(long, value_name = "DAYS")]
+        #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u64).range(1..))]
         age: Option<u64>,
     },
 }
@@ -102,16 +102,17 @@ fn main() -> Result<()> {
 
 /// `wtm prune`: lists (and with `yes`, deletes) stale comment files.
 fn prune(yes: bool, deleted_repos: bool, age: Option<u64>) -> Result<()> {
-    use comments::{Gone, Stale};
+    use comments::Gone;
     let (dir, entries) = comments::scan()?;
     let now = comments::now().0;
     let mut picked = Vec::new();
-    let mut skipped = 0;
+    let (mut skipped, mut listed) = (0, 0);
     for e in &entries {
-        match e.stale(deleted_repos, age, now) {
-            Some(why) => picked.push((e, why)),
-            None if matches!(e.gone, Some(Gone::Repo | Gone::Unknown)) => skipped += 1,
-            None => {}
+        match (e.stale(deleted_repos, age, now), e.gone) {
+            (Some(why), _) => picked.push((e, why)),
+            (None, Some(Gone::Repo | Gone::Unknown)) => skipped += 1,
+            (None, Some(Gone::Listed)) => listed += 1,
+            (None, _) => {}
         }
     }
     if picked.is_empty() {
@@ -119,25 +120,24 @@ fn prune(yes: bool, deleted_repos: bool, age: Option<u64>) -> Result<()> {
     } else {
         println!("Stale comment files in {}:", dir.display());
         for (e, why) in &picked {
-            let s = if e.comments == 1 { "" } else { "s" };
-            let why = match why {
-                Stale::Gone(Gone::Worktree) => "worktree removed".to_string(),
-                Stale::Gone(Gone::Repo) => "repository missing".to_string(),
-                Stale::Gone(Gone::Unknown) => "repository unknown".to_string(),
-                Stale::Idle(1) => "untouched for 1 day".to_string(),
-                Stale::Idle(days) => format!("untouched for {days} days"),
-            };
             println!(
-                "  {:>3} comment{s:<1}  {}  ({why})",
+                "  {:>3} comment{:<1}  {}  ({why})",
                 e.comments,
+                plural(e.comments),
                 e.worktree.display()
             );
         }
     }
     if skipped > 0 {
-        let s = if skipped == 1 { "" } else { "s" };
         println!(
-            "{skipped} file{s} of missing or unknown repositories skipped; add --deleted-repos to include them"
+            "{skipped} file{} of missing or unknown repositories skipped; add --deleted-repos to include them",
+            plural(skipped)
+        );
+    }
+    if listed > 0 {
+        println!(
+            "{listed} file{} of missing worktrees their repository still lists skipped; if they were deleted, run `git worktree prune` there first",
+            plural(listed)
         );
     }
     if picked.is_empty() {
@@ -155,10 +155,13 @@ fn prune(yes: bool, deleted_repos: bool, age: Option<u64>) -> Result<()> {
         }
     }
     let removed = picked.len() - failed;
-    let s = if removed == 1 { "" } else { "s" };
-    println!("Removed {removed} file{s}");
+    println!("Removed {removed} file{}", plural(removed));
     if failed > 0 {
-        anyhow::bail!("{failed} file(s) could not be removed");
+        anyhow::bail!("{failed} file{} could not be removed", plural(failed));
     }
     Ok(())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
