@@ -56,10 +56,11 @@ cd ../worktree-monitor-release-vX.Y.Z
 
 ## 4. Merge the PR
 
-- `gh pr checks --watch` and wait for green.
+- `gh pr checks --watch` and wait for green. The `main` ruleset requires all CI checks, a clean CodeQL result,
+  resolved conversations and an up-to-date branch.
 - If the branch is behind `main`, rebase it onto `origin/main` (never merge `main` into it), re-run the checks
   and **confirm** before `git push --force-with-lease`.
-- **Confirm**, then `gh pr merge`.
+- **Confirm**, then `gh pr merge --merge` (merge commits are the only allowed method).
 
 ## 5. Tag main
 
