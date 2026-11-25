@@ -66,6 +66,17 @@ wtm
 wtm --theme dracula      # or: export WTM_THEME=dracula
 ```
 
+Comment files of removed worktrees are deleted when `wtm` starts in their repository. To clean up all
+repositories at once, without starting the TUI:
+
+```sh
+wtm prune                    # list comment files whose worktrees were removed
+wtm prune --yes              # delete them
+wtm prune --deleted-repos    # also include repositories that no longer exist
+```
+
+`--deleted-repos` treats any repository missing from disk as deleted, including one on an unmounted volume.
+
 ## Keys
 
 Press `?` in the app for the full list.

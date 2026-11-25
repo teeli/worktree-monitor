@@ -13,7 +13,7 @@ mod worker;
 
 use anyhow::Result;
 use app::{App, AppEvent};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -29,10 +29,30 @@ struct Args {
     /// Color theme: `auto` follows the terminal's color scheme.
     #[arg(long, value_enum, env = "WTM_THEME", default_value = "auto")]
     theme: ThemeName,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List comment files of removed worktrees across all repositories, and delete them with
+    /// `--yes`. Doesn't need a repository.
+    Prune {
+        /// Delete the listed files instead of only listing them.
+        #[arg(long, short)]
+        yes: bool,
+        /// Also include files whose repository no longer exists on disk. Careful: a repository
+        /// on a volume that isn't mounted looks deleted too.
+        #[arg(long)]
+        deleted_repos: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::Prune { yes, deleted_repos }) = args.command {
+        return prune(yes, deleted_repos);
+    }
     let repo = git::discover(&std::env::current_dir()?)?;
 
     let (tx, rx) = mpsc::channel();
@@ -68,4 +88,58 @@ fn main() -> Result<()> {
     );
     ratatui::restore();
     res
+}
+
+/// `wtm prune`: lists (and with `yes`, deletes) comment files of removed worktrees.
+fn prune(yes: bool, deleted_repos: bool) -> Result<()> {
+    use comments::Gone;
+    let (dir, orphans) = comments::orphans()?;
+    let (picked, kept): (Vec<_>, Vec<_>) = orphans
+        .into_iter()
+        .partition(|o| deleted_repos || o.gone == Gone::Worktree);
+    if picked.is_empty() {
+        println!("No stale comment files in {}", dir.display());
+    } else {
+        println!("Stale comment files in {}:", dir.display());
+        for o in &picked {
+            let s = if o.comments == 1 { "" } else { "s" };
+            let why = match o.gone {
+                Gone::Worktree => "worktree removed",
+                Gone::Repo => "repository missing",
+            };
+            println!(
+                "  {:>3} comment{s:<1}  {}  ({why})",
+                o.comments,
+                o.worktree.display()
+            );
+        }
+    }
+    if !kept.is_empty() {
+        let n = kept.len();
+        let s = if n == 1 { "" } else { "s" };
+        println!(
+            "{n} file{s} of missing repositories skipped; add --deleted-repos to include them"
+        );
+    }
+    if picked.is_empty() {
+        return Ok(());
+    }
+    if !yes {
+        println!("Run with --yes to delete them");
+        return Ok(());
+    }
+    let mut failed = 0;
+    for o in &picked {
+        if let Err(e) = std::fs::remove_file(&o.path) {
+            eprintln!("removing {}: {e}", o.path.display());
+            failed += 1;
+        }
+    }
+    let removed = picked.len() - failed;
+    let s = if removed == 1 { "" } else { "s" };
+    println!("Removed {removed} file{s}");
+    if failed > 0 {
+        anyhow::bail!("{failed} file(s) could not be removed");
+    }
+    Ok(())
 }

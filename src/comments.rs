@@ -176,6 +176,94 @@ fn prune_in(dir: &Path, repo: &Path, live: &[&Path]) -> (usize, Option<anyhow::E
     (removed, error)
 }
 
+/// Why the worktree of an [`Orphan`] is considered gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Its repository exists but no longer has it registered. For files from older versions,
+    /// whose repository is unknown, its parent directory still exists.
+    Worktree,
+    /// Its repository is missing too, or unknown with the worktree's parent directory missing.
+    /// It may also be on a volume that isn't mounted.
+    Repo,
+}
+
+/// A comment file whose worktree directory no longer exists.
+#[derive(Debug)]
+pub struct Orphan {
+    pub path: PathBuf,
+    pub worktree: PathBuf,
+    pub comments: usize,
+    pub gone: Gone,
+}
+
+/// The comments directory and its files whose worktrees are gone, across all repositories.
+pub fn orphans() -> Result<(PathBuf, Vec<Orphan>)> {
+    let dir =
+        comments_dir().ok_or_else(|| anyhow!("no state directory (set XDG_STATE_HOME or HOME)"))?;
+    let found = orphans_in(&dir)?;
+    Ok((dir, found))
+}
+
+fn orphans_in(dir: &Path) -> Result<Vec<Orphan>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut found = Vec::new();
+    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        // Like `prune`, leave unreadable and foreign files alone.
+        let Some(file) = std::fs::read(&path)
+            .ok()
+            .and_then(|d| serde_json::from_slice::<CommentFile>(&d).ok())
+        else {
+            continue;
+        };
+        if path.file_name() != Some(file_name(&file.worktree).as_ref()) || file.worktree.exists() {
+            continue;
+        }
+        let gone = match &file.repo {
+            // Still registered, so git hasn't pruned it: missing for now, not removed.
+            Some(r) if r.is_dir() && registered(r, &file.worktree) => continue,
+            Some(r) if r.is_dir() => Gone::Worktree,
+            None if file.worktree.parent().is_some_and(Path::is_dir) => Gone::Worktree,
+            _ => Gone::Repo,
+        };
+        found.push(Orphan {
+            path,
+            worktree: file.worktree,
+            comments: file.comments.len(),
+            gone,
+        });
+    }
+    found.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+    Ok(found)
+}
+
+/// Whether the git common dir `repo` still lists the linked worktree `wt`.
+fn registered(repo: &Path, wt: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(repo.join("worktrees")) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        let Ok(gitdir) = std::fs::read_to_string(e.path().join("gitdir")) else {
+            return false;
+        };
+        // `gitdir` holds `<worktree>/.git`, not necessarily canonical.
+        let Some(dir) = Path::new(gitdir.trim()).parent() else {
+            return false;
+        };
+        dir == wt
+            || dir
+                .parent()
+                .zip(dir.file_name())
+                .is_some_and(|(p, n)| p.canonicalize().is_ok_and(|p| p.join(n) == wt))
+    })
+}
+
 pub fn now() -> (u64, u64) {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -663,6 +751,68 @@ mod tests {
         let (removed, error) = prune_in(&dir.path().join("missing"), repo, &wts);
         assert_eq!(removed, 0);
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn finds_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let comments = root.join("comments");
+        std::fs::create_dir(&comments).unwrap();
+        let repo = root.join("repo/.git");
+        std::fs::create_dir_all(repo.join("worktrees/away")).unwrap();
+        // Registered, with a non-canonical path, but missing (e.g. on an unmounted volume).
+        std::fs::write(
+            repo.join("worktrees/away/gitdir"),
+            format!("{}/repo/../away/.git\n", root.display()),
+        )
+        .unwrap();
+        let live = root.join("live");
+        std::fs::create_dir(&live).unwrap();
+        let put = |wt: &Path, repo: Option<&Path>| {
+            let mut json = serde_json::json!({
+                "version": 1,
+                "worktree": wt,
+                "comments": [comment(1, Side::New, 1, "x", None)],
+            });
+            if let Some(r) = repo {
+                json["repo"] = r.to_str().unwrap().into();
+            }
+            std::fs::write(comments.join(file_name(wt)), json.to_string()).unwrap();
+        };
+        put(&live, Some(&repo));
+        put(&root.join("away"), Some(&repo));
+        put(&root.join("removed"), Some(&repo));
+        put(&root.join("gone-repo"), Some(&root.join("gone/.git")));
+        put(&root.join("legacy"), None);
+        put(&root.join("missing/legacy"), None);
+        std::fs::write(comments.join("%broken.json"), "not json").unwrap();
+        std::fs::copy(
+            comments.join(file_name(&root.join("removed"))),
+            comments.join("renamed.json"),
+        )
+        .unwrap();
+
+        let found: Vec<_> = orphans_in(&comments)
+            .unwrap()
+            .into_iter()
+            .map(|o| {
+                assert_eq!(o.path, comments.join(file_name(&o.worktree)));
+                assert_eq!(o.comments, 1);
+                (o.worktree.strip_prefix(&root).unwrap().to_owned(), o.gone)
+            })
+            .collect();
+        let p = PathBuf::from;
+        assert_eq!(
+            found,
+            vec![
+                (p("gone-repo"), Gone::Repo),
+                (p("legacy"), Gone::Worktree),
+                (p("missing/legacy"), Gone::Repo),
+                (p("removed"), Gone::Worktree),
+            ]
+        );
+        assert!(orphans_in(&root.join("none")).unwrap().is_empty());
     }
 
     #[test]
