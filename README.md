@@ -83,15 +83,14 @@ that has handled review comments. (`wtm comments prune` is different: it covers 
 
 ```sh
 wtm comments list                     # open comments: id, file:line, commit, body, replies
-wtm comments list --all --json        # include closed ones, as JSON (schema/comments.schema.json, ids as strings)
+wtm comments list --all --json        # include closed ones, as JSON (schema/comments.schema.json)
 wtm comments reply <ID> --by NAME TEXT...  # reply to a comment (--by defaults to "agent"); TEXT "-" reads stdin
 wtm comments close <ID>... --by NAME  # close fixed or dropped comments (--by defaults to "agent")
 wtm comments reopen <ID>...
 ```
 
-They find the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
-represent exactly, so `--json` prints them (and reply ids) as strings. Editing a closed comment's text reopens it;
-replying doesn't.
+They find the worktree from any subdirectory, like git. Comment and reply ids are UUIDs. Editing a closed comment's
+text reopens it; replying doesn't.
 
 ### Cleaning up comment files
 

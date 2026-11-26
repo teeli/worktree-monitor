@@ -12,8 +12,8 @@
       "type": "string"
     },
     "version": {
-      "description": "File format version.",
-      "const": 1
+      "description": "File format version. Version 1 stored ids as integers (creation time in nanoseconds); wtm still reads those and rewrites them as UUIDs.",
+      "const": 2
     },
     "worktree": {
       "description": "Canonical path of the worktree.",
@@ -29,6 +29,11 @@
     }
   },
   "$defs": {
+    "id": {
+      "description": "Unique id (UUIDv7).",
+      "type": "string",
+      "format": "uuid"
+    },
     "side": {
       "description": "Diff side a line number refers to: deleted lines only exist in the old file.",
       "enum": ["old", "new"]
@@ -57,11 +62,7 @@
       "required": ["id", "file", "side", "line", "line_text", "commit", "head", "body", "created", "updated"],
       "additionalProperties": false,
       "properties": {
-        "id": {
-          "description": "Unique within the worktree (creation time in nanoseconds).",
-          "type": "integer",
-          "minimum": 0
-        },
+        "id": { "$ref": "#/$defs/id" },
         "file": { "description": "Repository-relative path of the commented file.", "type": "string" },
         "side": { "$ref": "#/$defs/side" },
         "line": {
@@ -104,11 +105,7 @@
       "required": ["id", "by", "body", "created", "updated"],
       "additionalProperties": false,
       "properties": {
-        "id": {
-          "description": "Unique within the comment (creation time in nanoseconds).",
-          "type": "integer",
-          "minimum": 0
-        },
+        "id": { "$ref": "#/$defs/id" },
         "by": {
           "description": "Who wrote it: \"user\" from the TUI, else the name given to `wtm comments reply --by` (e.g. an agent's).",
           "type": "string",

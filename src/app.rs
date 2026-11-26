@@ -1,7 +1,7 @@
 //! Application state, event handling and actions.
 
 use crate::clipboard::Clipboard;
-use crate::comments::{self, Anchors, Closed, Comment, LinePos, Reply, Side, Store};
+use crate::comments::{self, Anchors, Closed, Comment, Id, LinePos, Reply, Side, Store};
 use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Base, Commit, Conflict, FileChange, Repo, Worktree};
 use crate::input::{LineInput, Outcome};
@@ -102,21 +102,21 @@ pub struct WtState {
     /// Where the comments for the shown diff sit.
     pub anchors: Anchors,
     /// Comment highlighted in the comments pane; comment navigation continues from it.
-    pub comment_sel: Option<u64>,
+    pub comment_sel: Option<Id>,
     /// Reply of `comment_sel` highlighted; `None` for the comment itself.
-    pub reply_sel: Option<u64>,
+    pub reply_sel: Option<Id>,
     /// First comment pane entry shown.
     pub comments_offset: usize,
     /// Scroll the comments pane to `comment_sel` on the next render.
     pub comments_reveal: bool,
     /// Comment to select in the diff once its commit, file and diff have loaded.
-    pending_jump: Option<u64>,
+    pending_jump: Option<Id>,
     /// Working tree comment → HEAD its commit was last searched up to.
-    resolved: HashMap<u64, String>,
+    resolved: HashMap<Id, String>,
     /// HEAD and comments of the last search requested, to not repeat it while it runs.
-    resolve_sent: Option<(String, Vec<u64>)>,
+    resolve_sent: Option<(String, Vec<Id>)>,
     /// Working tree comments whose lines were found in no commit.
-    stale: HashSet<u64>,
+    stale: HashSet<Id>,
 }
 
 impl WtState {
@@ -277,7 +277,7 @@ impl WtState {
     }
 
     /// Highlights comment `id` itself; keeps the reply highlight if it is the same comment.
-    fn select_comment(&mut self, id: Option<u64>) {
+    fn select_comment(&mut self, id: Option<Id>) {
         if self.comment_sel != id {
             self.reply_sel = None;
         }
@@ -322,7 +322,7 @@ impl WtState {
             return Ok(Some("Comment deleted"));
         }
         c.body = body.to_string();
-        c.updated = comments::now().0;
+        c.updated = comments::now();
         let found = if existing {
             // Only what the input changed: the comment may have been moved to a commit
             // (or edited by another instance) meanwhile.
@@ -352,8 +352,8 @@ impl WtState {
     /// Replies never open or close the comment.
     fn save_reply(
         &mut self,
-        id: u64,
-        reply: Option<u64>,
+        id: Id,
+        reply: Option<Id>,
         body: &str,
     ) -> anyhow::Result<Option<&'static str>> {
         let (found, msg) = match (reply, body.is_empty()) {
@@ -476,7 +476,7 @@ pub enum Target {
         existing: bool,
     },
     /// A reply to comment `comment`: a new one, or editing reply `reply`.
-    Reply { comment: u64, reply: Option<u64> },
+    Reply { comment: Id, reply: Option<Id> },
 }
 
 /// Canonical git directory of a worktree; empty when it cannot be read (yet).
@@ -1638,7 +1638,7 @@ impl App {
     }
 
     /// Highlights comment `id`, or its reply `reply`, and shows the comment.
-    fn jump_to_entry(&mut self, id: u64, reply: Option<u64>) {
+    fn jump_to_entry(&mut self, id: Id, reply: Option<Id>) {
         self.jump_to_comment(id);
         if let Some(st) = self.wts.get_mut(self.active)
             && st.comment_sel == Some(id)
@@ -1648,7 +1648,7 @@ impl App {
     }
 
     /// Highlights comment `id` and shows it: selects its commit, file and line.
-    fn jump_to_comment(&mut self, id: u64) {
+    fn jump_to_comment(&mut self, id: Id) {
         let active = self.active;
         let commits_h = self.pane_height(Pane::Commits);
         let Some(st) = self.wts.get_mut(active) else {
@@ -1815,9 +1815,9 @@ impl App {
                 true,
             ),
             None => {
-                let (secs, nanos) = comments::now();
+                let secs = comments::now();
                 let comment = Comment {
-                    id: nanos,
+                    id: comments::new_id(),
                     file: file.path.clone(),
                     side: end.side,
                     line: end.line,

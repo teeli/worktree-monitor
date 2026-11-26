@@ -1,13 +1,17 @@
 //! Line comments, stored as JSON per worktree under the XDG state directory.
 
 use crate::diff::{Diff, DiffLine, LineKind};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
-const VERSION: u32 = 1;
+/// Id of a comment or reply: a UUIDv7.
+pub type Id = Uuid;
+
+const VERSION: u32 = 2;
 /// Furthest a committed line may be from where a working tree comment was written.
 const MAX_DRIFT: u32 = 100;
 /// JSON schema of the comment files; written next to them and referenced by `$schema`.
@@ -24,8 +28,8 @@ pub enum Side {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
-    /// Unique within the worktree (creation time in nanoseconds).
-    pub id: u64,
+    #[serde(deserialize_with = "id_compat")]
+    pub id: Id,
     /// Repo-relative path.
     pub file: String,
     pub side: Side,
@@ -53,8 +57,8 @@ pub struct Comment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
-    /// Unique within the comment (creation time in nanoseconds).
-    pub id: u64,
+    #[serde(deserialize_with = "id_compat")]
+    pub id: Id,
     /// Who wrote it: "user" from the TUI, else whatever `wtm comments reply --by` was given.
     pub by: String,
     pub body: String,
@@ -65,9 +69,9 @@ pub struct Reply {
 
 impl Reply {
     pub fn new(by: &str, body: &str) -> Self {
-        let (secs, nanos) = now();
+        let secs = now();
         Reply {
-            id: nanos,
+            id: new_id(),
             by: by.to_string(),
             body: body.to_string(),
             created: secs,
@@ -95,7 +99,7 @@ pub struct Closed {
 impl Closed {
     pub fn now(by: &str) -> Self {
         Closed {
-            at: now().0,
+            at: now(),
             by: by.to_string(),
         }
     }
@@ -162,6 +166,22 @@ fn write_schema(dir: &Path) -> Result<String> {
         std::fs::write(&path, SCHEMA).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(file_url(&path))
+}
+
+/// Parses a comment file, refusing ones from a newer `wtm`: rewriting them as `VERSION` could
+/// lose what this version doesn't know about.
+fn parse(data: &[u8]) -> Result<CommentFile> {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let Version { version } = serde_json::from_slice(data)?;
+    if version > VERSION {
+        bail!(
+            "version {version} is from a newer wtm (this one reads up to {VERSION}); upgrade wtm"
+        );
+    }
+    Ok(serde_json::from_slice(data)?)
 }
 
 /// Atomically writes `file` to `path`, with the schema next to the comments directory.
@@ -376,7 +396,7 @@ fn scan_in(dir: &Path) -> Result<Vec<Entry>> {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or_else(|| now().0, |d| d.as_secs()),
+                .map_or_else(now, |d| d.as_secs()),
         };
         found.push(Entry {
             path,
@@ -419,11 +439,51 @@ fn resolve(path: &Path) -> Option<PathBuf> {
     })
 }
 
-pub fn now() -> (u64, u64) {
+/// Unix seconds.
+pub fn now() -> u64 {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    (d.as_secs(), d.as_nanos() as u64)
+    d.as_secs()
+}
+
+/// A new, time-ordered id.
+pub fn new_id() -> Id {
+    Uuid::now_v7()
+}
+
+/// Reads an id: a UUID, or a version 1 id (creation time in nanoseconds), which maps to the
+/// same UUIDv7 on every read (see `legacy_id`).
+fn id_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Id, D::Error> {
+    struct IdVisitor;
+    impl serde::de::Visitor<'_> for IdVisitor {
+        type Value = Id;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a UUID string, or an integer id from version 1")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Id, E> {
+            Uuid::parse_str(v).map_err(|e| E::custom(format_args!("invalid id {v:?}: {e}")))
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Id, E> {
+            Ok(legacy_id(v))
+        }
+    }
+    d.deserialize_any(IdVisitor)
+}
+
+/// A fixed id for tests.
+#[cfg(test)]
+pub fn test_id(n: u128) -> Id {
+    Id::from_u128(n)
+}
+
+/// The UUIDv7 of a version 1 id (Unix time in nanoseconds): the milliseconds as its timestamp and
+/// the rest (< 2^20) in its last bytes, which the version and variant bits leave alone, so every
+/// value maps to a different UUID.
+fn legacy_id(nanos: u64) -> Id {
+    let mut bytes = [0; 10];
+    bytes[6..].copy_from_slice(&((nanos % 1_000_000) as u32).to_be_bytes());
+    uuid::Builder::from_unix_timestamp_millis(nanos / 1_000_000, &bytes).into_uuid()
 }
 
 pub struct Store {
@@ -481,9 +541,9 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let file: CommentFile =
-            serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(file.comments)
+        Ok(parse(&data)
+            .with_context(|| format!("parsing {}", path.display()))?
+            .comments)
     }
 
     /// Re-reads the file (another instance may have written it), applies `f` and writes it back.
@@ -517,13 +577,13 @@ impl Store {
         })
     }
 
-    pub fn remove(&mut self, id: u64) -> Result<()> {
+    pub fn remove(&mut self, id: Id) -> Result<()> {
         self.modify(|all| all.retain(|c| c.id != id))
     }
 
     /// Applies `f` to the stored comment `id`, leaving all others as they are on disk.
     /// Returns whether the comment still exists.
-    pub fn edit(&mut self, id: u64, f: impl FnOnce(&mut Comment)) -> Result<bool> {
+    pub fn edit(&mut self, id: Id, f: impl FnOnce(&mut Comment)) -> Result<bool> {
         let mut found = false;
         self.modify(|all| {
             if let Some(c) = all.iter_mut().find(|c| c.id == id) {
@@ -536,7 +596,7 @@ impl Store {
 
     /// Closes (`Some`) or reopens (`None`) comment `id`; closing keeps an earlier close.
     /// Returns whether the comment exists.
-    pub fn set_closed(&mut self, id: u64, closed: Option<Closed>) -> Result<bool> {
+    pub fn set_closed(&mut self, id: Id, closed: Option<Closed>) -> Result<bool> {
         self.edit(id, |c| match closed {
             Some(new) => {
                 c.closed.get_or_insert(new);
@@ -545,14 +605,11 @@ impl Store {
         })
     }
 
-    /// Appends `reply` to comment `id`, with an id above all its replies' (clock-based ids can
-    /// repeat or go backwards). Returns the id it got, or `None` if the comment doesn't exist.
-    pub fn add_reply(&mut self, id: u64, mut reply: Reply) -> Result<Option<u64>> {
+    /// Appends `reply` to comment `id`. Returns the reply's id, or `None` if the comment doesn't
+    /// exist.
+    pub fn add_reply(&mut self, id: Id, reply: Reply) -> Result<Option<Id>> {
         let mut added = None;
         self.edit(id, |c| {
-            if let Some(max) = c.replies.iter().map(|r| r.id).max() {
-                reply.id = reply.id.max(max + 1);
-            }
             added = Some(reply.id);
             c.replies.push(reply);
         })?;
@@ -561,7 +618,7 @@ impl Store {
 
     /// Replaces the body of reply `reply` of comment `id`, if it changed. Returns whether the
     /// reply exists.
-    pub fn edit_reply(&mut self, id: u64, reply: u64, body: &str) -> Result<bool> {
+    pub fn edit_reply(&mut self, id: Id, reply: Id, body: &str) -> Result<bool> {
         let unchanged =
             |c: &Comment| c.id == id && c.replies.iter().any(|r| r.id == reply && r.body == body);
         // Nothing to write, and `updated` stays.
@@ -573,7 +630,7 @@ impl Store {
             if let Some(r) = c.replies.iter_mut().find(|r| r.id == reply) {
                 if r.body != body {
                     r.body = body.to_string();
-                    r.updated = now().0;
+                    r.updated = now();
                 }
                 found = true;
             }
@@ -582,7 +639,7 @@ impl Store {
     }
 
     /// Deletes reply `reply` of comment `id`. Returns whether it existed.
-    pub fn remove_reply(&mut self, id: u64, reply: u64) -> Result<bool> {
+    pub fn remove_reply(&mut self, id: Id, reply: Id) -> Result<bool> {
         let mut found = false;
         self.edit(id, |c| {
             let before = c.replies.len();
@@ -593,7 +650,7 @@ impl Store {
     }
 
     /// Moves working tree comments to the commits their lines were committed in.
-    pub fn move_to_commits(&mut self, moves: &[(u64, String)]) -> Result<()> {
+    pub fn move_to_commits(&mut self, moves: &[(Id, String)]) -> Result<()> {
         self.modify(|all| {
             for c in all.iter_mut().filter(|c| c.commit.is_none()) {
                 if let Some((_, sha)) = moves.iter().find(|(id, _)| *id == c.id) {
@@ -696,7 +753,7 @@ pub fn order(
 
 /// Thread entries of the comments at `order` (indices into `comments`), in that order: each
 /// comment (`None`) followed by its replies (their ids).
-pub fn entries(comments: &[Comment], order: &[usize]) -> Vec<(usize, Option<u64>)> {
+pub fn entries(comments: &[Comment], order: &[usize]) -> Vec<(usize, Option<Id>)> {
     order
         .iter()
         .flat_map(|&ci| {
@@ -809,7 +866,7 @@ mod tests {
 
     fn comment(id: u64, side: Side, line: u32, text: &str, commit: Option<&str>) -> Comment {
         Comment {
-            id,
+            id: test_id(id.into()),
             file: "f".into(),
             side,
             line,
@@ -908,75 +965,172 @@ mod tests {
         let s2 = Store::load_from(wt, repo, Some(path.clone()));
         assert_eq!(s2.comments.len(), 2);
         assert_eq!(s2.comments[1], c);
-        s.remove(1).unwrap();
+        s.remove(test_id(1)).unwrap();
         assert_eq!(
             Store::load_from(wt, repo, Some(path.clone())).comments,
             vec![c.clone()]
         );
         // Only working tree comments move.
-        s.move_to_commits(&[(2, "def".into())]).unwrap();
+        s.move_to_commits(&[(test_id(2), "def".into())]).unwrap();
         assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
         // Edits touch only the given comment, and only what `f` changes.
-        assert!(s.edit(2, |c| c.body = "patched".into()).unwrap());
+        assert!(s.edit(test_id(2), |c| c.body = "patched".into()).unwrap());
         let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
         assert_eq!((stored.body.as_str(), stored.line), ("patched", 4));
-        assert!(!s.edit(99, |_| unreachable!()).unwrap());
+        assert!(!s.edit(test_id(99), |_| unreachable!()).unwrap());
 
         // Closing keeps the first close; reopening clears it.
         let first = Closed {
             at: 5,
             by: "claude".into(),
         };
-        assert!(s.set_closed(2, Some(first.clone())).unwrap());
-        assert!(s.set_closed(2, Some(Closed::now("user"))).unwrap());
+        assert!(s.set_closed(test_id(2), Some(first.clone())).unwrap());
+        assert!(s.set_closed(test_id(2), Some(Closed::now("user"))).unwrap());
         let stored = Store::load_from(wt, repo, Some(path.clone()));
         assert_eq!(stored.comments[0].closed.as_ref(), Some(&first));
-        assert!(s.set_closed(2, None).unwrap());
+        assert!(s.set_closed(test_id(2), None).unwrap());
         assert!(s.comments[0].closed.is_none());
-        assert!(!s.set_closed(99, None).unwrap());
+        assert!(!s.set_closed(test_id(99), None).unwrap());
 
         // Replies are added, edited and removed without touching the comment's state.
-        s.set_closed(2, Some(first.clone())).unwrap();
+        s.set_closed(test_id(2), Some(first.clone())).unwrap();
         let r1 = Reply {
-            id: 10,
+            id: test_id(10),
             ..Reply::new("claude", "fixed")
         };
         let r2 = Reply {
-            id: 11,
+            id: test_id(11),
             ..Reply::new("user", "thanks")
         };
-        assert_eq!(s.add_reply(2, r1.clone()).unwrap(), Some(10));
-        assert_eq!(s.add_reply(2, r2.clone()).unwrap(), Some(11));
-        assert_eq!(s.add_reply(99, r1.clone()).unwrap(), None);
-        // A repeated or older clock-based id is bumped past the others.
-        let dup = Reply {
-            id: 10,
-            ..Reply::new("claude", "again")
-        };
-        assert_eq!(s.add_reply(2, dup).unwrap(), Some(12));
-        assert!(s.remove_reply(2, 12).unwrap());
+        assert_eq!(
+            s.add_reply(test_id(2), r1.clone()).unwrap(),
+            Some(test_id(10))
+        );
+        assert_eq!(
+            s.add_reply(test_id(2), r2.clone()).unwrap(),
+            Some(test_id(11))
+        );
+        assert_eq!(s.add_reply(test_id(99), r1.clone()).unwrap(), None);
         // Unchanged text isn't written, so `updated` stays.
-        s.edit(2, |c| c.replies[0].updated = 3).unwrap();
-        assert!(s.edit_reply(2, 10, "fixed").unwrap());
+        s.edit(test_id(2), |c| c.replies[0].updated = 3).unwrap();
+        assert!(s.edit_reply(test_id(2), test_id(10), "fixed").unwrap());
         assert_eq!(s.comments[0].replies[0].updated, 3);
-        assert!(s.edit_reply(2, 10, "fixed in abc").unwrap());
+        assert!(
+            s.edit_reply(test_id(2), test_id(10), "fixed in abc")
+                .unwrap()
+        );
         assert_ne!(s.comments[0].replies[0].updated, 3);
-        assert!(!s.edit_reply(2, 99, "x").unwrap());
+        assert!(!s.edit_reply(test_id(2), test_id(99), "x").unwrap());
         let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
         let bodies: Vec<&str> = stored.replies.iter().map(|r| r.body.as_str()).collect();
         assert_eq!(bodies, ["fixed in abc", "thanks"]);
         assert_eq!(stored.closed.as_ref(), Some(&first));
-        assert!(s.remove_reply(2, 10).unwrap());
-        assert!(!s.remove_reply(2, 10).unwrap());
+        assert!(s.remove_reply(test_id(2), test_id(10)).unwrap());
+        assert!(!s.remove_reply(test_id(2), test_id(10)).unwrap());
         assert_eq!(s.comments[0].replies, vec![r2]);
         assert_eq!(s.comments[0].closed.as_ref(), Some(&first));
-        s.set_closed(2, None).unwrap();
+        s.set_closed(test_id(2), None).unwrap();
 
         std::fs::write(&path, "not json").unwrap();
         let mut broken = Store::load_from(wt, repo, Some(path.clone()));
         assert!(broken.error.is_some());
         assert!(broken.upsert(comment(3, Side::New, 1, "x", None)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn migrates_integer_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
+        let nanos = 1_764_000_000_123_456_789_u64;
+        let mut c = serde_json::to_value(comment(0, Side::New, 1, "a", None)).unwrap();
+        c["id"] = nanos.into();
+        c["replies"] = serde_json::json!([
+            {"id": nanos, "by": "user", "body": "r1", "created": 0, "updated": 0},
+            {"id": nanos + 1, "by": "user", "body": "r2", "created": 0, "updated": 0},
+        ]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let v1 = serde_json::json!({"version": 1, "worktree": wt, "comments": [c]});
+        std::fs::write(&path, v1.to_string()).unwrap();
+
+        let mut s = Store::load_from(wt, repo, Some(path.clone()));
+        assert_eq!(s.error, None);
+        let c = s.comments[0].clone();
+        assert_eq!(c.id.get_version_num(), 7);
+        let ts = c.id.get_timestamp().unwrap().to_unix();
+        assert_eq!(ts, (nanos / 1_000_000_000, 123_000_000));
+        // Stable across reads, distinct per value.
+        assert_eq!(
+            Store::load_from(wt, repo, Some(path.clone())).comments[0],
+            c
+        );
+        assert_eq!(c.replies[0].id, c.id);
+        assert_ne!(c.replies[0].id, c.replies[1].id);
+
+        // Any write persists them as UUIDs, unchanged.
+        assert!(s.set_closed(c.id, Some(Closed::now("user"))).unwrap());
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file["version"], 2);
+        assert_eq!(file["comments"][0]["id"], c.id.to_string());
+        assert_eq!(
+            file["comments"][0]["replies"][1]["id"],
+            c.replies[1].id.to_string()
+        );
+        let reread = &Store::load_from(wt, repo, Some(path)).comments[0];
+        assert_eq!((reread.id, &reread.replies), (c.id, &c.replies));
+    }
+
+    #[test]
+    fn new_ids_are_distinct() {
+        let (a, b) = (Reply::new("a", "x"), Reply::new("a", "x"));
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.id.get_version_num(), 7);
+    }
+
+    #[test]
+    fn legacy_ids_keep_every_bit() {
+        // Values differing only in high or low bits, which version/variant bits could clobber.
+        let vals = [
+            0,
+            1,
+            999_999,
+            1_000_000,
+            1 << 62,
+            (1 << 62) | (1 << 63),
+            u64::MAX,
+            u64::MAX - 1,
+        ];
+        let ids: HashSet<Id> = vals.iter().map(|&n| legacy_id(n)).collect();
+        assert_eq!(ids.len(), vals.len());
+        assert!(ids.iter().all(|id| id.get_version_num() == 7));
+    }
+
+    #[test]
+    fn rejects_bad_ids_and_newer_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut c = serde_json::to_value(comment(1, Side::New, 1, "a", None)).unwrap();
+        let load = |c: &serde_json::Value, version| {
+            let f = serde_json::json!({"version": version, "worktree": wt, "comments": [c]});
+            std::fs::write(&path, f.to_string()).unwrap();
+            Store::load_from(wt, repo, Some(path.clone()))
+        };
+        assert_eq!(load(&c, VERSION).error, None);
+
+        c["id"] = "0193-oops".into();
+        let err = load(&c, VERSION).error.unwrap();
+        assert!(err.contains("invalid id \"0193-oops\""), "{err}");
+
+        let mut s = load(&c, VERSION + 1);
+        assert!(s.error.as_deref().unwrap().contains("newer wtm"));
+        // Never rewritten.
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(s.set_closed(test_id(1), None).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]
@@ -990,7 +1144,9 @@ mod tests {
         assert!(!mine.reload_if_changed());
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut other = Store::load_from(wt, repo, Some(path.clone()));
-        other.set_closed(1, Some(Closed::now("agent"))).unwrap();
+        other
+            .set_closed(test_id(1), Some(Closed::now("agent")))
+            .unwrap();
         // Seen even when the mtime doesn't change (coarse-grained file systems).
         std::fs::File::options()
             .write(true)
@@ -1043,10 +1199,10 @@ mod tests {
         cs[4].created = 1;
         cs[6].file = "e".into();
         let log = ["new", "old"];
-        let ids = |cs: &[Comment], all| -> Vec<u64> {
+        let ids = |cs: &[Comment], all| -> Vec<u128> {
             order(cs, all, |sha| log.iter().position(|s| *s == sha))
                 .into_iter()
-                .map(|i| cs[i].id)
+                .map(|i| cs[i].id.as_u128())
                 .collect()
         };
         assert_eq!(ids(&cs, false), vec![6, 3, 4, 7, 1, 5, 2]);
@@ -1099,13 +1255,18 @@ mod tests {
         ];
         for id in [7, 8] {
             cs[1].replies.push(Reply {
-                id,
+                id: test_id(id),
                 ..Reply::new("a", "r")
             });
         }
         assert_eq!(
             entries(&cs, &[1, 0]),
-            vec![(1, None), (1, Some(7)), (1, Some(8)), (0, None)]
+            vec![
+                (1, None),
+                (1, Some(test_id(7))),
+                (1, Some(test_id(8))),
+                (0, None)
+            ]
         );
         // The newest reply counts as a change.
         assert_eq!(cs[0].touched(), 0);

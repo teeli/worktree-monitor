@@ -109,7 +109,7 @@ pub enum GitResult {
     ResolveComments {
         wt: PathBuf,
         head: String,
-        res: Vec<(u64, Resolved)>,
+        res: Vec<(comments::Id, Resolved)>,
     },
 }
 
@@ -207,7 +207,7 @@ fn execute(repo_dir: &std::path::Path, job: Job) -> GitResult {
     }
 }
 
-fn resolve_comments(wt: &std::path::Path, comments: &[Comment]) -> Vec<(u64, Resolved)> {
+fn resolve_comments(wt: &std::path::Path, comments: &[Comment]) -> Vec<(comments::Id, Resolved)> {
     // One history per (HEAD when written, file); `None` when it can't be read.
     let mut histories = std::collections::HashMap::new();
     comments
