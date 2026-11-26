@@ -22,7 +22,9 @@ commit history, side by side and updating in near-realtime.
   `Ctrl-n` / `Ctrl-p` (or a click on an entry) jump to a comment, switching to its commit, file and line.
   Once the lines of a working tree comment are committed, the comment moves to that commit; if they can't be found
   in any commit since (e.g. the changes were discarded), it is marked *stale*. Comments on unchanged lines can't be
-  traced to a commit and become stale as well.
+  traced to a commit and become stale as well. When the branch is rewritten (rebase, squash, fixup), comments follow
+  their commit to its rewritten one: the commit with the same changes to the file, else the one their line is now in.
+  If the rewrite changed their line, they are marked *stale* too.
 - **Closing comments.** `x` closes the comment on the selected line (or highlighted in the pane) once it is fixed or
   dropped, and reopens a closed one. Closed comments are hidden; `X` shows them, dimmed. Each records when and by whom
   it was closed; editing its text reopens it. Agents close comments with `wtm comments close` (see [below](#comments-from-the-command-line)), and

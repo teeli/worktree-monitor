@@ -649,12 +649,17 @@ impl Store {
         Ok(found)
     }
 
-    /// Moves working tree comments to the commits their lines were committed in.
-    pub fn move_to_commits(&mut self, moves: &[(Id, String)]) -> Result<()> {
+    /// Moves comments to the commits their lines are now in: working tree comments to where
+    /// they were committed, comments on rewritten commits to their rewritten ones. Each move
+    /// `(id, from, to)` applies only while the comment is still on `from`.
+    pub fn move_to_commits(&mut self, moves: &[(Id, Option<String>, String)]) -> Result<()> {
         self.modify(|all| {
-            for c in all.iter_mut().filter(|c| c.commit.is_none()) {
-                if let Some((_, sha)) = moves.iter().find(|(id, _)| *id == c.id) {
-                    c.commit = Some(sha.clone());
+            for c in all.iter_mut() {
+                if let Some((_, _, to)) = moves
+                    .iter()
+                    .find(|(id, from, _)| *id == c.id && *from == c.commit)
+                {
+                    c.commit = Some(to.clone());
                 }
             }
         })
@@ -690,6 +695,36 @@ pub fn resolve_commit<'a>(c: &Comment, history: &'a [(String, Diff)]) -> Option<
         })
         .min_by_key(|&(dist, k, _)| (dist, k))
         .map(|(_, _, sha)| sha)
+}
+
+/// Whether two patches of a file make the same changes, ignoring line numbers and headers
+/// (a per-file patch-id), so a commit can be recognized after a rebase.
+pub fn same_patch(a: &Diff, b: &Diff) -> bool {
+    let changes = |d: &Diff| {
+        d.lines
+            .iter()
+            .filter(|l| matches!(l.kind, LineKind::Add | LineKind::Del))
+            .map(|l| (l.kind, l.text.clone()))
+            .collect::<Vec<_>>()
+    };
+    let a = changes(a);
+    !a.is_empty() && a == changes(b)
+}
+
+/// The commit in `history` (oldest first) that a comment on a rewritten commit, whose patch
+/// for the comment's file was `old`, most likely became: the only one with the same patch
+/// (a rebase), else the one its line is in (a squash, fixup or conflict resolution; see
+/// `resolve_commit`). `None` when its line is gone (e.g. a fixup rewrote it).
+pub fn resolve_rewritten<'a>(
+    c: &Comment,
+    old: &Diff,
+    history: &'a [(String, Diff)],
+) -> Option<&'a str> {
+    let mut same = history.iter().filter(|(_, d)| same_patch(old, d));
+    if let (Some((sha, _)), None) = (same.next(), same.next()) {
+        return Some(sha);
+    }
+    resolve_commit(c, history)
 }
 
 /// Where the comments of one diff are shown.
@@ -970,9 +1005,15 @@ mod tests {
             Store::load_from(wt, repo, Some(path.clone())).comments,
             vec![c.clone()]
         );
-        // Only working tree comments move.
-        s.move_to_commits(&[(test_id(2), "def".into())]).unwrap();
+        // Only comments still on the expected commit move.
+        s.move_to_commits(&[(test_id(2), None, "def".into())])
+            .unwrap();
         assert_eq!(s.comments[0].commit.as_deref(), Some("abc"));
+        s.move_to_commits(&[(test_id(2), Some("abc".into()), "def".into())])
+            .unwrap();
+        assert_eq!(s.comments[0].commit.as_deref(), Some("def"));
+        s.move_to_commits(&[(test_id(2), Some("def".into()), "abc".into())])
+            .unwrap();
         // Edits touch only the given comment, and only what `f` changes.
         assert!(s.edit(test_id(2), |c| c.body = "patched".into()).unwrap());
         let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
@@ -1245,6 +1286,42 @@ mod tests {
             text: "missing".into(),
         });
         assert_eq!(r(range), None);
+    }
+
+    #[test]
+    fn resolves_rewritten_commits() {
+        let d = diff::parse;
+        let h = |sha: &str, raw: &str| (sha.to_string(), d(raw));
+        let old = d("@@ -1,2 +1,2 @@\n x\n-y\n+z\n");
+        // Same changes at other line numbers, with other context: the same patch.
+        assert!(same_patch(&old, &d("@@ -7,3 +7,3 @@\n q\n-y\n+z\n r\n")));
+        assert!(!same_patch(&old, &d("@@ -1,2 +1,2 @@\n x\n-y\n+Z\n")));
+        assert!(!same_patch(&d(""), &d("")));
+
+        let rebased = vec![
+            h("other", "@@ -1,1 +1,2 @@\n x\n+x\n"),
+            h("moved", "@@ -5,2 +5,2 @@\n x\n-y\n+z\n"),
+        ];
+        let r = |c: &Comment, hist: &[(String, Diff)]| {
+            resolve_rewritten(c, &old, hist).map(String::from)
+        };
+        // An unchanged line, which content alone can't place, follows its patch.
+        let ctx = comment(1, Side::New, 1, "x", Some("old"));
+        assert_eq!(r(&ctx, &rebased).as_deref(), Some("moved"));
+        // Squashed with another change: found by its line.
+        let squashed = vec![h("sq", "@@ -1,2 +1,3 @@\n x\n-y\n+z\n+w\n")];
+        let line = comment(2, Side::New, 2, "z", Some("old"));
+        assert_eq!(r(&line, &squashed).as_deref(), Some("sq"));
+        assert_eq!(r(&ctx, &squashed), None);
+        // A fixup rewrote the line.
+        let fixed = vec![h("fx", "@@ -1,2 +1,2 @@\n x\n-y\n+z2\n")];
+        assert_eq!(r(&line, &fixed), None);
+        // Two identical patches are ambiguous: fall back to the line (nearest, then oldest).
+        let twice = vec![
+            h("first", "@@ -9,2 +9,2 @@\n x\n-y\n+z\n"),
+            rebased[1].clone(),
+        ];
+        assert_eq!(r(&line, &twice).as_deref(), Some("moved"));
     }
 
     #[test]

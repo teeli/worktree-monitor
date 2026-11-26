@@ -540,11 +540,20 @@ pub fn commit_diff(wt: &Path, commit: &Commit, file: &FileChange) -> Result<Stri
     Ok(cap(run_ok(wt, &args)?))
 }
 
-/// The first `MAX_HISTORY` commits in `since..HEAD` touching `file`, oldest first, each with
-/// its patch for `file` (capped like other diffs).
-pub fn file_history(wt: &Path, since: &str, file: &str) -> Result<Vec<(String, String)>> {
+/// The first `MAX_HISTORY` commits in `since..HEAD` (and not on `exclude`) touching `file`,
+/// oldest first, each with its patch for `file` (capped like other diffs).
+pub fn file_history(
+    wt: &Path,
+    since: &str,
+    exclude: Option<&str>,
+    file: &str,
+) -> Result<Vec<(String, String)>> {
     let range = format!("{since}..HEAD");
-    let out = run_ok(wt, &["rev-list", "--reverse", &range, "--", file])?;
+    let not = exclude.map(|e| format!("^{e}"));
+    let mut args = vec!["rev-list", "--reverse", &range];
+    args.extend(not.as_deref());
+    args.extend(["--", file]);
+    let out = run_ok(wt, &args)?;
     let out = String::from_utf8_lossy(&out);
     let shas: Vec<&str> = out.split_whitespace().take(MAX_HISTORY).collect();
     if shas.is_empty() {
@@ -560,6 +569,49 @@ pub fn file_history(wt: &Path, since: &str, file: &str) -> Result<Vec<(String, S
     args.extend(&shas);
     args.extend(["--", file]);
     Ok(parse_history(&cap(run_ok(wt, &args)?)))
+}
+
+/// Whether `commit` is reachable from HEAD; `None` when it doesn't exist (any more).
+pub fn in_history(wt: &Path, commit: &str) -> Result<Option<bool>> {
+    let obj = format!("{commit}^{{commit}}");
+    if run(wt, &["rev-parse", "--verify", "--quiet", &obj], &[0, 1])?.is_empty() {
+        return Ok(None);
+    }
+    let out = command(wt)
+        .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+        .output()
+        .context("failed to run git (is it installed?)")?;
+    match out.status.code() {
+        Some(0) => Ok(Some(true)),
+        Some(1) => Ok(Some(false)),
+        _ => bail!(
+            "git merge-base: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// Best common ancestor of `commit` and HEAD; `None` when they share no history.
+pub fn merge_base(wt: &Path, commit: &str) -> Result<Option<String>> {
+    let out = run(wt, &["merge-base", commit, "HEAD"], &[0, 1])?;
+    let sha = String::from_utf8_lossy(&out).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// The patch of `commit` for `file` (capped like other diffs); root commits against the
+/// empty tree.
+pub fn file_patch(wt: &Path, commit: &str, file: &str) -> Result<String> {
+    let args = [
+        "diff-tree",
+        "-p",
+        "--root",
+        "--no-commit-id",
+        "--no-ext-diff",
+        commit,
+        "--",
+        file,
+    ];
+    Ok(cap(run_ok(wt, &args)?))
 }
 
 fn parse_history(s: &str) -> Vec<(String, String)> {

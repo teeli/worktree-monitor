@@ -79,7 +79,7 @@
           "$ref": "#/$defs/linePos"
         },
         "commit": {
-          "description": "Commit the line was viewed in; null for the working tree.",
+          "description": "Commit the line was viewed in; null for the working tree. Set once a working tree comment's line is committed, and updated when the commit is rewritten (rebase, squash, fixup).",
           "$ref": "#/$defs/sha"
         },
         "head": {
