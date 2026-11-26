@@ -2,7 +2,7 @@
 //! the TUI, e.g. by an AI agent that handled them, and cleaning up comment files of removed
 //! worktrees.
 
-use crate::comments::{self, Closed, Comment, Entry, Gone, Reply, Store};
+use crate::comments::{self, Closed, Comment, Entry, Gone, Id, Reply, Store};
 use crate::git;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -43,7 +43,7 @@ pub enum WorktreeCmd {
     /// Reply to a comment, e.g. with how it was handled or a question. Doesn't open or close it.
     Reply {
         /// Id of the comment, as `list` prints it.
-        id: u64,
+        id: Id,
         /// Who replies, e.g. the agent's name.
         #[arg(long, default_value = "agent")]
         by: String,
@@ -54,7 +54,7 @@ pub enum WorktreeCmd {
     /// Close comments that were fixed or dropped.
     Close {
         #[arg(required = true, value_name = "ID")]
-        ids: Vec<u64>,
+        ids: Vec<Id>,
         /// Who closed them, e.g. the agent's name.
         #[arg(long, default_value = "agent")]
         by: String,
@@ -62,7 +62,7 @@ pub enum WorktreeCmd {
     /// Reopen closed comments.
     Reopen {
         #[arg(required = true, value_name = "ID")]
-        ids: Vec<u64>,
+        ids: Vec<Id>,
     },
 }
 
@@ -94,7 +94,7 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         CommentsCmd::Prune(args) => {
             let (dir, entries) = comments::scan()?;
-            let now = comments::now().0;
+            let now = comments::now();
             let out = &mut std::io::stdout().lock();
             prune(&dir, &entries, &args, now, out, &mut std::io::stderr())
         }
@@ -142,7 +142,7 @@ fn comments_cmd(
 
 fn reply(
     store: &mut Store,
-    id: u64,
+    id: Id,
     by: &str,
     text: &[String],
     stdin: &mut impl Read,
@@ -175,17 +175,6 @@ fn list(store: &Store, all: bool, json: bool, out: &mut impl Write) -> Result<()
         .map(|i| &store.comments[i])
         .collect();
     if json {
-        let shown = shown
-            .into_iter()
-            .map(|c| {
-                let mut v = serde_json::to_value(c)?;
-                v["id"] = c.id.to_string().into();
-                for (r, reply) in c.replies.iter().enumerate() {
-                    v["replies"][r]["id"] = reply.id.to_string().into();
-                }
-                Ok(v)
-            })
-            .collect::<Result<Vec<_>>>()?;
         serde_json::to_writer_pretty(&mut *out, &shown)?;
         writeln!(out)?;
         return Ok(());
@@ -297,12 +286,12 @@ fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comments::{LinePos, Side};
+    use crate::comments::{LinePos, Side, test_id};
     use std::path::Path;
 
     fn comment(id: u64, line: u32, commit: Option<&str>) -> Comment {
         Comment {
-            id,
+            id: test_id(id.into()),
             file: "src/a.rs".into(),
             side: Side::New,
             line,
@@ -334,6 +323,7 @@ mod tests {
 
     #[test]
     fn lists_closes_and_reopens() {
+        let (id1, id2) = (test_id(1), test_id(2));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("comments").join("wt.json");
         let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
@@ -351,45 +341,52 @@ mod tests {
         let (res, out) = run(
             &mut s,
             WorktreeCmd::Close {
-                ids: vec![2],
+                ids: vec![id2],
                 by: "claude".into(),
             },
         );
         res.unwrap();
-        assert_eq!(out, "Closed 2\n");
+        assert_eq!(out, format!("Closed {id2}\n"));
         // Another instance sees it closed.
         let mut s = Store::load_from(wt, repo, Some(path.clone()));
         assert_eq!(
             run(&mut s, list(false, false)).1,
-            "1  src/a.rs:3\n    fix 1\n    please\n"
+            format!("{id1}  src/a.rs:3\n    fix 1\n    please\n")
         );
         assert_eq!(
             run(&mut s, list(true, false)).1,
-            "1  src/a.rs:3\n    fix 1\n    please\n\
-             2  src/a.rs:5-7 @ aaaaaaa · closed by claude\n    fix 2\n    please\n"
+            format!(
+                "{id1}  src/a.rs:3\n    fix 1\n    please\n\
+                 {id2}  src/a.rs:5-7 @ aaaaaaa · closed by claude\n    fix 2\n    please\n"
+            )
         );
         let json: serde_json::Value =
             serde_json::from_str(&run(&mut s, list(true, true)).1).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 2);
-        assert_eq!(json[1]["id"], "2");
+        assert_eq!(json[1]["id"], id2.to_string());
         assert_eq!(json[1]["closed"]["by"], "claude");
 
         // Unknown ids fail, after the known ones were handled.
-        let (res, out) = run(&mut s, WorktreeCmd::Reopen { ids: vec![2, 9] });
-        assert!(res.unwrap_err().to_string().contains('9'));
-        assert_eq!(out, "Reopened 2\n");
+        let ids = vec![id2, test_id(9)];
+        let (res, out) = run(&mut s, WorktreeCmd::Reopen { ids });
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains(&test_id(9).to_string())
+        );
+        assert_eq!(out, format!("Reopened {id2}\n"));
         assert!(s.comments.iter().all(|c| c.closed.is_none()));
 
         let blank = WorktreeCmd::Close {
-            ids: vec![1],
+            ids: vec![id1],
             by: " ".into(),
         };
         assert!(run(&mut s, blank).0.is_err());
     }
 
-    fn reply_cmd(id: u64, by: &str, text: &[&str]) -> WorktreeCmd {
+    fn reply_cmd(id: u128, by: &str, text: &[&str]) -> WorktreeCmd {
         WorktreeCmd::Reply {
-            id,
+            id: test_id(id),
             by: by.into(),
             text: text.iter().map(|t| t.to_string()).collect(),
         }
@@ -402,11 +399,11 @@ mod tests {
         let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
         let mut s = Store::load_from(wt, repo, Some(path.clone()));
         s.upsert(comment(1, 3, None)).unwrap();
-        s.set_closed(1, Some(Closed::now("user"))).unwrap();
+        s.set_closed(test_id(1), Some(Closed::now("user"))).unwrap();
 
         let (res, out) = run(&mut s, reply_cmd(1, "claude", &["Fixed", "in", "abc"]));
         res.unwrap();
-        assert_eq!(out, "Replied to 1\n");
+        assert_eq!(out, format!("Replied to {}\n", test_id(1)));
         let (res, _) = run_with(
             &mut s,
             reply_cmd(1, "claude", &["-"]),
@@ -423,9 +420,12 @@ mod tests {
 
         assert_eq!(
             run(&mut s, list(true, false)).1,
-            "1  src/a.rs:3 · closed by user\n    fix 1\n    please\n\
-             \x20   ↳ claude\n      Fixed in abc\n\
-             \x20   ↳ claude\n      why?\n      really?\n"
+            format!(
+                "{}  src/a.rs:3 · closed by user\n    fix 1\n    please\n\
+                 \x20   ↳ claude\n      Fixed in abc\n\
+                 \x20   ↳ claude\n      why?\n      really?\n",
+                test_id(1)
+            )
         );
         let json: serde_json::Value =
             serde_json::from_str(&run(&mut s, list(true, true)).1).unwrap();
@@ -434,11 +434,33 @@ mod tests {
         assert_eq!(r["by"], "claude");
 
         let err = |s: &mut Store, cmd, stdin| run_with(s, cmd, stdin).0.unwrap_err().to_string();
-        assert!(err(&mut s, reply_cmd(9, "a", &["x"]), "").contains('9'));
+        let unknown = test_id(9).to_string();
+        assert!(err(&mut s, reply_cmd(9, "a", &["x"]), "").contains(&unknown));
         assert!(err(&mut s, reply_cmd(1, " ", &["x"]), "").contains("--by"));
         assert!(err(&mut s, reply_cmd(1, "a", &[" "]), "").contains("empty"));
         assert!(err(&mut s, reply_cmd(1, "a", &["-"]), "\n").contains("empty"));
         assert_eq!(s.comments[0].replies.len(), 2);
+    }
+
+    #[test]
+    fn parses_uuid_ids() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: WorktreeCmd,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from(["wtm"].iter().chain(args));
+        let id = test_id(1).to_string();
+        let Ok(Cli {
+            cmd: WorktreeCmd::Close { ids, .. },
+        }) = parse(&["close", &id])
+        else {
+            panic!("close <uuid> must parse");
+        };
+        assert_eq!(ids, [test_id(1)]);
+        assert!(parse(&["close", "1"]).is_err());
+        assert!(parse(&["reply", "not-a-uuid", "x"]).is_err());
     }
 
     #[test]
@@ -449,7 +471,7 @@ mod tests {
         let mut s = Store::load_from(Path::new("/wt"), Path::new("/r"), Some(path.clone()));
         assert!(run(&mut s, list(false, false)).0.is_err());
         let close = WorktreeCmd::Close {
-            ids: vec![1],
+            ids: vec![test_id(1)],
             by: "a".into(),
         };
         assert!(run(&mut s, close).0.is_err());

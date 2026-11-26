@@ -34,7 +34,7 @@ flag), run `cargo run -q -- comments list --json` there instead. Use whichever w
 - `[]`: report "no open wtm comments" and skip the rest.
 
 Each element is a comment object as described in `schema/comments.schema.json`; read the field descriptions
-there. Use `id` (a string) verbatim, never as a number.
+there. Use `id` (a UUID string) verbatim.
 
 Read each comment's whole thread: `body`, then `replies` (oldest first, absent when there are none; `by` is
 `"user"` for the user, else an agent's name). A later user reply can answer an earlier agent question or change

@@ -1,7 +1,7 @@
 //! Rendering. Also records the screen regions the app uses for mouse hit-testing.
 
 use crate::app::{App, CommentInput, Target, WtState};
-use crate::comments::Comment;
+use crate::comments::{Comment, Id};
 use crate::diff::{Diff, LineKind};
 use crate::keymap::{BINDINGS, MOUSE_HELP, Section};
 use crate::theme::Theme;
@@ -613,7 +613,7 @@ const REPLY_INDENT: usize = 2;
 
 impl<'a> Note<'a> {
     /// The thread of `c`; `sel` highlights its body (`Some(None)`) or a reply.
-    fn thread(c: &'a Comment, sel: Option<Option<u64>>) -> Self {
+    fn thread(c: &'a Comment, sel: Option<Option<Id>>) -> Self {
         let body = Seg {
             by: None,
             text: &c.body,
@@ -729,7 +729,7 @@ fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Op
         cursor: Some(input.edit.cursor_byte()),
         selected: false,
     };
-    let find = |id: u64| all.iter().find(|c| c.id == id);
+    let find = |id: Id| all.iter().find(|c| c.id == id);
     let (thread, slot) = match &input.target {
         Target::Comment {
             comment,
@@ -937,7 +937,7 @@ pub fn comment_at_row(
     show_closed: bool,
     rel: usize,
     inner: Rect,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<(Id, Option<Id>)> {
     let entries = pane_entries(st, show_closed, inner.width as usize);
     let off = st.comments_offset;
     let skip = entries
@@ -1291,6 +1291,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comments::test_id;
 
     #[test]
     fn panel_split() {
@@ -1398,7 +1399,7 @@ mod tests {
     #[test]
     fn lays_out_threads() {
         let mut c = crate::comments::Comment {
-            id: 1,
+            id: test_id(1),
             file: "f".into(),
             side: crate::comments::Side::New,
             line: 1,
@@ -1414,11 +1415,11 @@ mod tests {
         };
         for (id, body) in [(7, "ok"), (8, "one\ntwo")] {
             c.replies.push(crate::comments::Reply {
-                id,
+                id: test_id(id),
                 ..crate::comments::Reply::new("claude", body)
             });
         }
-        let n = Note::thread(&c, Some(Some(8)));
+        let n = Note::thread(&c, Some(Some(test_id(8))));
         let rows: Vec<(usize, bool, &str, usize)> = n
             .rows(7)
             .iter()
