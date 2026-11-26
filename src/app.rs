@@ -1817,7 +1817,7 @@ impl App {
             None => {
                 let secs = comments::now();
                 let comment = Comment {
-                    id: Id::now_v7(),
+                    id: comments::new_id(),
                     file: file.path.clone(),
                     side: end.side,
                     line: end.line,

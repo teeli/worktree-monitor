@@ -1,7 +1,7 @@
 //! Line comments, stored as JSON per worktree under the XDG state directory.
 
 use crate::diff::{Diff, DiffLine, LineKind};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -71,7 +71,7 @@ impl Reply {
     pub fn new(by: &str, body: &str) -> Self {
         let secs = now();
         Reply {
-            id: Uuid::now_v7(),
+            id: new_id(),
             by: by.to_string(),
             body: body.to_string(),
             created: secs,
@@ -166,6 +166,22 @@ fn write_schema(dir: &Path) -> Result<String> {
         std::fs::write(&path, SCHEMA).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(file_url(&path))
+}
+
+/// Parses a comment file, refusing ones from a newer `wtm`: rewriting them as `VERSION` could
+/// lose what this version doesn't know about.
+fn parse(data: &[u8]) -> Result<CommentFile> {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let Version { version } = serde_json::from_slice(data)?;
+    if version > VERSION {
+        bail!(
+            "version {version} is from a newer wtm (this one reads up to {VERSION}); upgrade wtm"
+        );
+    }
+    Ok(serde_json::from_slice(data)?)
 }
 
 /// Atomically writes `file` to `path`, with the schema next to the comments directory.
@@ -431,19 +447,28 @@ pub fn now() -> u64 {
     d.as_secs()
 }
 
+/// A new, time-ordered id.
+pub fn new_id() -> Id {
+    Uuid::now_v7()
+}
+
 /// Reads an id: a UUID, or a version 1 id (creation time in nanoseconds), which maps to the
-/// same UUIDv7 on every read (with its millisecond timestamp) and a distinct one per value.
+/// same UUIDv7 on every read (see `legacy_id`).
 fn id_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Id, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Raw {
-        Uuid(Uuid),
-        Legacy(u64),
+    struct IdVisitor;
+    impl serde::de::Visitor<'_> for IdVisitor {
+        type Value = Id;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a UUID string, or an integer id from version 1")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Id, E> {
+            Uuid::parse_str(v).map_err(|e| E::custom(format_args!("invalid id {v:?}: {e}")))
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Id, E> {
+            Ok(legacy_id(v))
+        }
     }
-    Ok(match Raw::deserialize(d)? {
-        Raw::Uuid(id) => id,
-        Raw::Legacy(nanos) => legacy_id(nanos),
-    })
+    d.deserialize_any(IdVisitor)
 }
 
 /// A fixed id for tests.
@@ -452,9 +477,12 @@ pub fn test_id(n: u128) -> Id {
     Id::from_u128(n)
 }
 
+/// The UUIDv7 of a version 1 id (Unix time in nanoseconds): the milliseconds as its timestamp and
+/// the rest (< 2^20) in its last bytes, which the version and variant bits leave alone, so every
+/// value maps to a different UUID.
 fn legacy_id(nanos: u64) -> Id {
     let mut bytes = [0; 10];
-    bytes[2..].copy_from_slice(&nanos.to_be_bytes());
+    bytes[6..].copy_from_slice(&((nanos % 1_000_000) as u32).to_be_bytes());
     uuid::Builder::from_unix_timestamp_millis(nanos / 1_000_000, &bytes).into_uuid()
 }
 
@@ -513,9 +541,9 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let file: CommentFile =
-            serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(file.comments)
+        Ok(parse(&data)
+            .with_context(|| format!("parsing {}", path.display()))?
+            .comments)
     }
 
     /// Re-reads the file (another instance may have written it), applies `f` and writes it back.
@@ -1059,6 +1087,50 @@ mod tests {
         let (a, b) = (Reply::new("a", "x"), Reply::new("a", "x"));
         assert_ne!(a.id, b.id);
         assert_eq!(a.id.get_version_num(), 7);
+    }
+
+    #[test]
+    fn legacy_ids_keep_every_bit() {
+        // Values differing only in high or low bits, which version/variant bits could clobber.
+        let vals = [
+            0,
+            1,
+            999_999,
+            1_000_000,
+            1 << 62,
+            (1 << 62) | (1 << 63),
+            u64::MAX,
+            u64::MAX - 1,
+        ];
+        let ids: HashSet<Id> = vals.iter().map(|&n| legacy_id(n)).collect();
+        assert_eq!(ids.len(), vals.len());
+        assert!(ids.iter().all(|id| id.get_version_num() == 7));
+    }
+
+    #[test]
+    fn rejects_bad_ids_and_newer_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments").join("wt.json");
+        let (wt, repo) = (Path::new("/wt"), Path::new("/repo/.git"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut c = serde_json::to_value(comment(1, Side::New, 1, "a", None)).unwrap();
+        let load = |c: &serde_json::Value, version| {
+            let f = serde_json::json!({"version": version, "worktree": wt, "comments": [c]});
+            std::fs::write(&path, f.to_string()).unwrap();
+            Store::load_from(wt, repo, Some(path.clone()))
+        };
+        assert_eq!(load(&c, VERSION).error, None);
+
+        c["id"] = "0193-oops".into();
+        let err = load(&c, VERSION).error.unwrap();
+        assert!(err.contains("invalid id \"0193-oops\""), "{err}");
+
+        let mut s = load(&c, VERSION + 1);
+        assert!(s.error.as_deref().unwrap().contains("newer wtm"));
+        // Never rewritten.
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(s.set_closed(test_id(1), None).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]
