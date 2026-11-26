@@ -1029,7 +1029,12 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
                 Some(commit) => (format!(" @ {}", commit.short), theme.sha),
                 None => {
                     let short = sha.get(..7).unwrap_or(sha);
-                    (format!(" @ {short} · not in history"), theme.error)
+                    let why = if st.is_stale(c) {
+                        "stale"
+                    } else {
+                        "not in history"
+                    };
+                    (format!(" @ {short} · {why}"), theme.error)
                 }
             },
         };

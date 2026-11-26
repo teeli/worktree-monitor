@@ -240,10 +240,11 @@ impl WtState {
         })
     }
 
-    /// Whether `c` is a working tree comment whose file is unchanged and whose lines were
-    /// committed nowhere (e.g. the changes were discarded).
+    /// Whether `c`'s lines are gone: a working tree comment whose file is unchanged and whose
+    /// lines were committed nowhere (e.g. the changes were discarded), or a comment whose
+    /// commit was rewritten without its lines (e.g. by a fixup changing them).
     pub fn is_stale(&self, c: &Comment) -> bool {
-        c.commit.is_none() && self.stale.contains(&c.id) && !self.changed(&c.file)
+        self.stale.contains(&c.id) && (c.commit.is_some() || !self.changed(&c.file))
     }
 
     fn changed(&self, file: &str) -> bool {
@@ -945,7 +946,13 @@ impl App {
                     }
                     st.resolved.insert(id, head.clone());
                     match r {
-                        Resolved::Commit(sha) => moves.push((id, sha)),
+                        Resolved::Commit(sha) => {
+                            st.stale.remove(&id);
+                            let from = st.comments.comments.iter().find(|c| c.id == id);
+                            if let Some(c) = from {
+                                moves.push((id, c.commit.clone(), sha));
+                            }
+                        }
                         Resolved::Nowhere => {
                             st.stale.insert(id);
                         }
@@ -969,7 +976,7 @@ impl App {
                         );
                         // A jump waiting for a moved comment now has to go to its commit.
                         let pending = self.wts[i].pending_jump;
-                        if let Some(id) = pending.filter(|id| moves.iter().any(|(m, _)| m == id))
+                        if let Some(id) = pending.filter(|id| moves.iter().any(|(m, ..)| m == id))
                             && i == self.active
                         {
                             self.jump_to_comment(id);
@@ -982,9 +989,11 @@ impl App {
     }
 
     /// Looks for the commits of working tree comments whose file has no uncommitted changes
-    /// any more, once per HEAD. Each request covers every comment still unresolved, as the
-    /// worker only keeps the latest one per worktree.
+    /// any more, and of comments whose commit isn't in the loaded log (maybe rewritten by a
+    /// rebase, squash or fixup), once per HEAD. Each request covers every comment still
+    /// unresolved, as the worker only keeps the latest one per worktree.
     fn resolve_comments(&mut self, i: usize) {
+        let base = self.base_of(i);
         let st = &mut self.wts[i];
         let Some(head) = st.info.head.clone().filter(|_| st.loaded) else {
             return;
@@ -993,7 +1002,10 @@ impl App {
             .comments
             .comments
             .iter()
-            .filter(|c| c.commit.is_none() && !st.changed(&c.file))
+            .filter(|c| match &c.commit {
+                None => !st.changed(&c.file),
+                Some(sha) => !st.commits.iter().any(|x| &x.sha == sha),
+            })
             .filter(|c| st.resolved.get(&c.id) != Some(&head))
             .cloned()
             .collect();
@@ -1006,7 +1018,12 @@ impl App {
         }
         st.resolve_sent = Some(sent);
         let wt = st.info.path.clone();
-        self.send(Job::ResolveComments { wt, head, comments });
+        self.send(Job::ResolveComments {
+            wt,
+            head,
+            base,
+            comments,
+        });
     }
 
     /// Whether a comment input is open for worktree `wt`.
@@ -1666,9 +1683,14 @@ impl App {
             };
             let Some(target) = target else {
                 st.pending_jump = None;
-                let sha = c.commit.unwrap_or_default();
-                let short = sha.get(..7).unwrap_or(&sha);
-                self.notify(format!("Commit {short} is not in the loaded history"), true);
+                let msg = if st.is_stale(&c) {
+                    "Comment is stale: its commit was rewritten without its lines".to_string()
+                } else {
+                    let sha = c.commit.unwrap_or_default();
+                    let short = sha.get(..7).unwrap_or(&sha).to_string();
+                    format!("Commit {short} is not in the loaded history")
+                };
+                self.notify(msg, true);
                 return;
             };
             self.select_commit(target);
