@@ -545,18 +545,36 @@ impl Store {
         })
     }
 
-    /// Appends `reply` to comment `id`. Returns whether the comment exists.
-    pub fn add_reply(&mut self, id: u64, reply: Reply) -> Result<bool> {
-        self.edit(id, |c| c.replies.push(reply))
+    /// Appends `reply` to comment `id`, with an id above all its replies' (clock-based ids can
+    /// repeat or go backwards). Returns the id it got, or `None` if the comment doesn't exist.
+    pub fn add_reply(&mut self, id: u64, mut reply: Reply) -> Result<Option<u64>> {
+        let mut added = None;
+        self.edit(id, |c| {
+            if let Some(max) = c.replies.iter().map(|r| r.id).max() {
+                reply.id = reply.id.max(max + 1);
+            }
+            added = Some(reply.id);
+            c.replies.push(reply);
+        })?;
+        Ok(added)
     }
 
-    /// Replaces the body of reply `reply` of comment `id`. Returns whether the reply exists.
+    /// Replaces the body of reply `reply` of comment `id`, if it changed. Returns whether the
+    /// reply exists.
     pub fn edit_reply(&mut self, id: u64, reply: u64, body: &str) -> Result<bool> {
+        let unchanged =
+            |c: &Comment| c.id == id && c.replies.iter().any(|r| r.id == reply && r.body == body);
+        // Nothing to write, and `updated` stays.
+        if self.comments.iter().any(unchanged) {
+            return Ok(true);
+        }
         let mut found = false;
         self.edit(id, |c| {
             if let Some(r) = c.replies.iter_mut().find(|r| r.id == reply) {
-                r.body = body.to_string();
-                r.updated = now().0;
+                if r.body != body {
+                    r.body = body.to_string();
+                    r.updated = now().0;
+                }
                 found = true;
             }
         })?;
@@ -927,10 +945,22 @@ mod tests {
             id: 11,
             ..Reply::new("user", "thanks")
         };
-        assert!(s.add_reply(2, r1.clone()).unwrap());
-        assert!(s.add_reply(2, r2.clone()).unwrap());
-        assert!(!s.add_reply(99, r1.clone()).unwrap());
+        assert_eq!(s.add_reply(2, r1.clone()).unwrap(), Some(10));
+        assert_eq!(s.add_reply(2, r2.clone()).unwrap(), Some(11));
+        assert_eq!(s.add_reply(99, r1.clone()).unwrap(), None);
+        // A repeated or older clock-based id is bumped past the others.
+        let dup = Reply {
+            id: 10,
+            ..Reply::new("claude", "again")
+        };
+        assert_eq!(s.add_reply(2, dup).unwrap(), Some(12));
+        assert!(s.remove_reply(2, 12).unwrap());
+        // Unchanged text isn't written, so `updated` stays.
+        s.edit(2, |c| c.replies[0].updated = 3).unwrap();
+        assert!(s.edit_reply(2, 10, "fixed").unwrap());
+        assert_eq!(s.comments[0].replies[0].updated, 3);
         assert!(s.edit_reply(2, 10, "fixed in abc").unwrap());
+        assert_ne!(s.comments[0].replies[0].updated, 3);
         assert!(!s.edit_reply(2, 99, "x").unwrap());
         let stored = &Store::load_from(wt, repo, Some(path.clone())).comments[0];
         let bodies: Vec<&str> = stored.replies.iter().map(|r| r.body.as_str()).collect();

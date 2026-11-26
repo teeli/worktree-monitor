@@ -413,6 +413,9 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
     st.diff_offset = off;
     let st = &*st;
+    // Rows of the first line's block scrolled past, so a reply further down its thread shows.
+    let skip = diff_skip(st, input, wrap, text_w, width, h);
+    let lim = h + skip;
 
     let num = |n: Option<u32>| n.map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
     let build = |gutter: String,
@@ -459,10 +462,10 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let sel = st.sel_range();
-    let mut out = Vec::with_capacity(h);
+    let mut out = Vec::with_capacity(lim);
     let mut cursor = None;
     for (i, l) in st.diff.lines.iter().enumerate().skip(off) {
-        if out.len() >= h {
+        if out.len() >= lim {
             break;
         }
         let (marker, style) = line_style(l.kind);
@@ -487,7 +490,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             vec![skip_cols(&l.text, st.diff_hscroll)]
         };
         for (k, chunk) in chunks.into_iter().enumerate() {
-            if out.len() >= h {
+            if out.len() >= lim {
                 break;
             }
             out.push(if k == 0 {
@@ -522,7 +525,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         let mut rows = vec![rule("├")];
         for r in note.rows(width) {
             if let Some(col) = r.cursor
-                && out.len() + rows.len() < h
+                && out.len() + rows.len() < lim
             {
                 cursor = Some((2 + r.indent + col, out.len() + rows.len()));
             }
@@ -541,10 +544,12 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
             ));
         }
         rows.push(rule("└"));
-        out.extend(rows.into_iter().take(h - out.len()));
+        out.extend(rows.into_iter().take(lim - out.len()));
     }
+    out.drain(..skip.min(out.len()));
     f.render_widget(Paragraph::new(out), inner);
-    if let Some((x, y)) = cursor {
+    if let Some((x, y)) = cursor.and_then(|(x, y): (usize, usize)| Some((x, y.checked_sub(skip)?)))
+    {
         let x = (x as u16).min(inner.width.saturating_sub(1));
         f.set_cursor_position((inner.x + x, inner.y + y as u16));
     }
@@ -673,7 +678,10 @@ fn cursor_at(text: &str, rows: &[&str], b: usize) -> Option<(usize, usize)> {
     let base = text.as_ptr() as usize;
     for (r, row) in rows.iter().enumerate() {
         let start = row.as_ptr() as usize - base;
-        if b < start + row.len() || r + 1 == rows.len() {
+        let end = start + row.len();
+        // A cursor on a line break is drawn after the row it ends, not on the next one.
+        let on_break = b == end && text[end..].starts_with('\n');
+        if b < end || on_break || r + 1 == rows.len() {
             return Some((r, text[start..b.max(start)].width()));
         }
     }
@@ -752,7 +760,7 @@ fn note_at<'a>(st: &'a WtState, input: Option<&'a CommentInput>, i: usize) -> Op
         }
         // A new comment, or a new reply at the end of its thread.
         _ => note.segs.push(Seg {
-            by: matches!(input.target, Target::Reply { .. }).then_some("user"),
+            by: matches!(input.target, Target::Reply { .. }).then_some(crate::app::USER),
             ..edit
         }),
     }
@@ -776,12 +784,49 @@ fn line_rows(
     width: usize,
     i: usize,
 ) -> usize {
-    let line = if wrap {
+    text_rows(st, wrap, text_w, i) + note_at(st, input, i).map_or(0, |n| n.height(width))
+}
+
+/// Screen rows of diff line `i`'s text.
+fn text_rows(st: &WtState, wrap: bool, text_w: usize, i: usize) -> usize {
+    if wrap {
         wrap_ranges(&st.diff.lines[i].text, text_w).len()
     } else {
         1
+    }
+}
+
+/// Rows of the first shown diff line's block to skip, so that the reply being edited or
+/// highlighted below the selected line fits in `h` rows when its thread is taller than that.
+fn diff_skip(
+    st: &WtState,
+    input: Option<&CommentInput>,
+    wrap: bool,
+    text_w: usize,
+    width: usize,
+    h: usize,
+) -> usize {
+    let Some(line) = input.map(|i| i.at).or(st.diff_sel) else {
+        return 0;
     };
-    line + note_at(st, input, i).map_or(0, |n| n.height(width))
+    let Some(note) = note_at(st, input, line).filter(|_| st.diff_offset == line) else {
+        return 0;
+    };
+    // The line's text and the rule above the thread.
+    let lead = text_rows(st, wrap, text_w, line) + 1;
+    focus_skip(&note, &note.rows(width), lead, h)
+}
+
+/// Rows to skip of a block of `lead` rows followed by `note`'s `rows`, so that the entry being
+/// edited, or a highlighted reply, ends within `h` rows.
+fn focus_skip(note: &Note, rows: &[ThreadRow], lead: usize, h: usize) -> usize {
+    let focus = |r: &ThreadRow| {
+        let seg = &note.segs[r.seg];
+        seg.cursor.is_some() || seg.selected && seg.by.is_some()
+    };
+    rows.iter()
+        .rposition(focus)
+        .map_or(0, |last| (lead + last + 1).saturating_sub(h))
 }
 
 fn num_width(diff: &Diff) -> usize {
@@ -829,10 +874,12 @@ pub fn wrap_ranges(text: &str, width: usize) -> Vec<&str> {
 
 /// Maps a screen row (relative to the diff pane) to the diff line drawn there.
 /// Returns `diff.lines.len()` when the row is past the end.
-pub fn line_at_row(st: &WtState, wrap: bool, rel: usize, inner_width: u16) -> usize {
-    let text_w = text_width(&st.diff, inner_width);
-    row_to_line(st.diff_offset, st.diff.lines.len(), rel, |i| {
-        line_rows(st, None, wrap, text_w, inner_width as usize, i)
+pub fn line_at_row(st: &WtState, wrap: bool, rel: usize, inner: Rect) -> usize {
+    let text_w = text_width(&st.diff, inner.width);
+    let width = inner.width as usize;
+    let skip = diff_skip(st, None, wrap, text_w, width, inner.height as usize);
+    row_to_line(st.diff_offset, st.diff.lines.len(), rel + skip, |i| {
+        line_rows(st, None, wrap, text_w, width, i)
     })
 }
 
@@ -848,37 +895,64 @@ fn row_to_line(offset: usize, len: usize, rel: usize, rows: impl Fn(usize) -> us
     len
 }
 
-/// Screen rows of a comments pane entry `width` columns wide: header, thread, blank separator.
-fn entry_rows(c: &Comment, width: usize) -> usize {
-    Note::thread(c, None).rows(width).len() + 2
+/// A comments pane entry: a comment (index into `comments.comments`), its thread with the
+/// highlighted entry marked, and the thread's rows.
+struct PaneEntry<'a> {
+    ci: usize,
+    note: Note<'a>,
+    rows: Vec<ThreadRow<'a>>,
 }
 
-/// Id of the comment drawn at screen row `rel` of the comments pane, and of the reply if the
-/// row is one of its rows.
+impl PaneEntry<'_> {
+    /// Screen rows: header, thread, blank separator.
+    fn height(&self) -> usize {
+        self.rows.len() + 2
+    }
+
+    /// Rows skipped when the entry is shown first, so its highlighted reply fits in `h` rows.
+    fn skip(&self, h: usize) -> usize {
+        focus_skip(&self.note, &self.rows, 1, h)
+    }
+}
+
+/// The comments pane's entries in order, laid out `width` columns wide.
+fn pane_entries(st: &WtState, show_closed: bool, width: usize) -> Vec<PaneEntry<'_>> {
+    let all = &st.comments.comments;
+    st.comment_order(show_closed)
+        .into_iter()
+        .map(|ci| {
+            let c = &all[ci];
+            let sel = (st.comment_sel == Some(c.id)).then_some(st.reply_sel);
+            let note = Note::thread(c, sel);
+            let rows = note.rows(width);
+            PaneEntry { ci, note, rows }
+        })
+        .collect()
+}
+
+/// Id of the comment drawn at screen row `rel` of the comments pane (`inner`), and of the
+/// reply if the row is one of its rows.
 pub fn comment_at_row(
     st: &WtState,
     show_closed: bool,
     rel: usize,
-    inner_width: u16,
+    inner: Rect,
 ) -> Option<(u64, Option<u64>)> {
-    let order = st.comment_order(show_closed);
-    let all = &st.comments.comments;
-    let mut top = 0;
-    for &ci in order.iter().skip(st.comments_offset) {
-        let c = &all[ci];
-        let rows = Note::thread(c, None).rows(inner_width as usize);
-        if rel < top + rows.len() + 2 {
-            // Below the header: the thread's rows, then the blank separator.
-            let seg = rel
-                .checked_sub(top + 1)
-                .and_then(|k| rows.get(k))
-                .map(|r| r.seg);
-            let reply = seg.and_then(|k| Some(c.replies.get(k.checked_sub(1)?)?.id));
-            return Some((c.id, reply));
-        }
-        top += rows.len() + 2;
-    }
-    None
+    let entries = pane_entries(st, show_closed, inner.width as usize);
+    let off = st.comments_offset;
+    let skip = entries
+        .get(off)
+        .map_or(0, |e| e.skip(inner.height as usize));
+    let i = row_to_line(off, entries.len(), rel + skip, |i| entries[i].height());
+    let e = entries.get(i)?;
+    let top: usize = entries[off..i].iter().map(PaneEntry::height).sum();
+    // Below the header: the thread's rows, then the blank separator.
+    let seg = (rel + skip - top)
+        .checked_sub(1)
+        .and_then(|k| e.rows.get(k));
+    let c = &st.comments.comments[e.ci];
+    let reply = seg.and_then(|r| Some(c.replies.get(r.seg.checked_sub(1)?)?.id));
+    Some((c.id, reply))
 }
 
 fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
@@ -906,9 +980,12 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let h = inner.height as usize;
     let w = inner.width as usize;
+    let reveal = std::mem::take(&mut st.comments_reveal);
+    let st = &*st;
     let all = &st.comments.comments;
-    let heights: Vec<usize> = order.iter().map(|&ci| entry_rows(&all[ci], w)).collect();
-    let len = order.len();
+    let entries = pane_entries(st, app.show_closed, w);
+    let heights: Vec<usize> = entries.iter().map(PaneEntry::height).collect();
+    let len = entries.len();
     // Don't scroll past the point where the last entry reaches the bottom.
     let (mut max, mut total) = (len, 0);
     while max > 0 && total < h {
@@ -922,8 +999,8 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
     let mut off = st.comments_offset.min(max);
     let sel = st
         .comment_sel
-        .and_then(|id| order.iter().position(|&ci| all[ci].id == id));
-    if let Some(sel) = sel.filter(|_| std::mem::take(&mut st.comments_reveal)) {
+        .and_then(|id| entries.iter().position(|e| all[e.ci].id == id));
+    if let Some(sel) = sel.filter(|_| reveal) {
         // Scroll so the whole selected entry fits if it can.
         off = off.min(sel);
         let mut total: usize = heights[off..=sel].iter().sum();
@@ -932,16 +1009,15 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
             off += 1;
         }
     }
-    st.comments_offset = off;
-    let st = &*st;
-    let all = &st.comments.comments;
+    // A highlighted reply below the bottom of a tall first entry is scrolled into view.
+    let skip = entries[off].skip(h);
 
-    let mut out: Vec<Line> = Vec::with_capacity(h);
-    for (i, &ci) in order.iter().enumerate().skip(off) {
-        if out.len() >= h {
+    let mut out: Vec<Line> = Vec::with_capacity(h + skip);
+    for (i, e) in entries.iter().enumerate().skip(off) {
+        if out.len() >= h + skip {
             break;
         }
-        let c = &all[ci];
+        let c = &all[e.ci];
         let lines = match &c.start {
             Some(s) if s.line != c.line => format!(":{}-{}", s.line, c.line),
             _ => format!(":{}", c.line),
@@ -979,20 +1055,19 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(tag, tag_style),
             Span::styled(closed, theme.dim),
         ];
-        let selected = sel == Some(i);
-        out.push(if selected {
+        out.push(if sel == Some(i) {
             patch_row(fit_spans(header, w), theme.diff_sel)
         } else {
             Line::from(fit_spans(header, w))
         });
         // The highlighted entry: the comment itself or one of its replies.
-        let note = Note::thread(c, selected.then_some(st.reply_sel));
-        for r in note.rows(w) {
-            let selected = note.segs[r.seg].selected;
-            out.push(thread_row(&r, bar_style, body_style, selected, w, &theme));
+        for r in &e.rows {
+            let selected = e.note.segs[r.seg].selected;
+            out.push(thread_row(r, bar_style, body_style, selected, w, &theme));
         }
         out.push(Line::raw(""));
     }
+    out.drain(..skip.min(out.len()));
     out.truncate(h);
     f.render_widget(Paragraph::new(out), inner);
 
@@ -1011,6 +1086,7 @@ fn draw_comments(f: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+    app.wts[app.active].comments_offset = off;
 }
 
 fn draw_commits(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1309,6 +1385,14 @@ mod tests {
         assert_eq!(cursors(&n), vec![None, Some(4)]);
         let n = note("", 0);
         assert_eq!(cursors(&n), vec![Some(0)]);
+        // On a line break: after the row it ends; past it: at the next row's start.
+        let n = note("ab\ncd", 2);
+        assert_eq!(texts(&n), vec!["ab", "cd"]);
+        assert_eq!(cursors(&n), vec![Some(2), None]);
+        let n = note("ab\ncd", 3);
+        assert_eq!(cursors(&n), vec![None, Some(0)]);
+        let n = note("ab\n\ncd", 3);
+        assert_eq!(cursors(&n), vec![None, Some(0), None]);
     }
 
     #[test]
@@ -1354,8 +1438,17 @@ mod tests {
         );
         let sel: Vec<bool> = n.segs.iter().map(|s| s.selected).collect();
         assert_eq!(sel, vec![false, false, true]);
-        assert_eq!(entry_rows(&c, 7), 9);
         assert_eq!(n.height(7), 9);
+
+        // The highlighted reply ends on thread row 7, after `lead` rows: skip what doesn't fit.
+        let rows = n.rows(7);
+        assert_eq!(focus_skip(&n, &rows, 1, 10), 0);
+        assert_eq!(focus_skip(&n, &rows, 1, 5), 3);
+        // A highlighted comment body, or nothing highlighted, scrolls nothing.
+        for sel in [Some(None), None] {
+            let n = Note::thread(&c, sel);
+            assert_eq!(focus_skip(&n, &n.rows(7), 1, 2), 0);
+        }
     }
 
     #[test]

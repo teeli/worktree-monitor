@@ -367,14 +367,12 @@ impl WtState {
             }
             (Some(r), false) => (self.comments.edit_reply(id, r, body)?, "Reply saved"),
             (None, false) => {
-                let new = Reply::new("user", body);
-                let r = new.id;
-                let found = self.comments.add_reply(id, new)?;
-                if found {
+                let added = self.comments.add_reply(id, Reply::new(USER, body))?;
+                if let Some(r) = added {
                     self.select_comment(Some(id));
                     self.reply_sel = Some(r);
                 }
-                (found, "Reply saved")
+                (added.is_some(), "Reply saved")
             }
         };
         if !found {
@@ -383,8 +381,10 @@ impl WtState {
         Ok(Some(msg))
     }
 
-    /// Highlights the comment on the selected diff line, if there is one.
+    /// Highlights the comment on the selected diff line, if there is one. The user moved the
+    /// selection, so a highlighted reply goes back to its comment.
     fn follow_selection(&mut self) {
+        self.reply_sel = None;
         let shown = self.diff_sel.and_then(|s| self.anchors.by_line.get(&s));
         if let Some(c) = shown.and_then(|a| self.comments.comments.get(a.comment)) {
             self.select_comment(Some(c.id));
@@ -453,6 +453,9 @@ impl WtState {
         })
     }
 }
+
+/// Author of comments and replies written in the TUI.
+pub const USER: &str = "user";
 
 /// A comment being written or edited below its diff line. While it is open, the worktree's
 /// file selection and diff are not refreshed, so the line it belongs to stays put.
@@ -1294,6 +1297,7 @@ impl App {
             }
             Action::CloseComment => self.toggle_closed_comment(),
             Action::Reply => self.start_reply(),
+            Action::DeleteReply => self.delete_reply(),
             Action::ToggleClosed => {
                 self.show_closed = !self.show_closed;
                 for st in &mut self.wts {
@@ -1594,9 +1598,7 @@ impl App {
             return;
         };
         let (id, close) = (c.id, c.closed.is_none());
-        let res = st
-            .comments
-            .set_closed(id, close.then(|| Closed::now("user")));
+        let res = st.comments.set_closed(id, close.then(|| Closed::now(USER)));
         st.reanchor(show_closed);
         st.drop_hidden_sel(show_closed);
         let msg = match res {
@@ -1770,14 +1772,24 @@ impl App {
         let start = (first != at).then_some(start);
         let shown = st.anchors.by_line.get(&at);
         let shown = shown.and_then(|a| st.comments.comments.get(a.comment));
-        // A highlighted reply of the comment there is edited instead of the comment.
+        // A highlighted reply of the comment there is edited instead of the comment, unless a
+        // new range was selected to move the comment.
         let reply = shown
-            .filter(|c| st.comment_sel == Some(c.id))
+            .filter(|c| start.is_none() && st.comment_sel == Some(c.id))
             .and_then(|c| {
                 let r = c.replies.iter().find(|r| Some(r.id) == st.reply_sel)?;
                 Some((c.id, r))
             });
         if let Some((id, r)) = reply {
+            // Others' replies stay theirs: who wrote what is what agents go by.
+            if r.by != USER {
+                let msg = format!(
+                    "Only your own replies can be edited (by {}); R replies, D deletes",
+                    r.by
+                );
+                self.notify(msg, true);
+                return;
+            }
             self.input = Some(CommentInput {
                 edit: LineInput::new(&r.body),
                 wt: st.info.path.clone(),
@@ -1833,6 +1845,24 @@ impl App {
         });
     }
 
+    /// Deletes the highlighted reply, whoever wrote it.
+    fn delete_reply(&mut self) {
+        let show_closed = self.show_closed;
+        let Some(st) = self.wts.get_mut(self.active) else {
+            return;
+        };
+        let (Some(id), Some(r)) = (st.comment_sel, st.reply_sel) else {
+            self.notify("Highlight a reply to delete (Ctrl-n / Ctrl-p)".into(), true);
+            return;
+        };
+        let res = st.save_reply(id, Some(r), "");
+        st.reanchor(show_closed);
+        match res {
+            Ok(msg) => self.notify(msg.unwrap_or_default().into(), false),
+            Err(e) => self.notify(format!("Deleting reply failed: {e:#}"), true),
+        }
+    }
+
     /// Opens a reply input below the comment on the selected line, else the one highlighted
     /// in the pane if it is shown in the diff.
     fn start_reply(&mut self) {
@@ -1853,7 +1883,7 @@ impl App {
             return;
         };
         let id = st.comments.comments[ci].id;
-        st.select_comment(Some(id));
+        // The highlight moves to the comment once the reply is saved, not on cancel.
         self.input = Some(CommentInput {
             edit: LineInput::default(),
             wt: st.info.path.clone(),
@@ -1923,7 +1953,7 @@ impl App {
                         }
                     }
                     Pane::Diff => {
-                        let line = crate::ui::line_at_row(st, self.wrap, rel, self.hit.diff.width);
+                        let line = crate::ui::line_at_row(st, self.wrap, rel, self.hit.diff);
                         if line < st.diff.lines.len() {
                             st.diff_sel = Some(line);
                             st.diff_anchor = None;
@@ -1939,7 +1969,7 @@ impl App {
                     }
                     Pane::Comments => {
                         if let Some((id, reply)) =
-                            crate::ui::comment_at_row(st, self.show_closed, rel, rect.width)
+                            crate::ui::comment_at_row(st, self.show_closed, rel, rect)
                         {
                             self.jump_to_entry(id, reply);
                         }

@@ -162,7 +162,7 @@ fn reply(
     if body.is_empty() {
         bail!("the reply must not be empty");
     }
-    if !store.add_reply(id, Reply::new(by, body))? {
+    if store.add_reply(id, Reply::new(by, body))?.is_none() {
         bail!("no comment with id {id}");
     }
     writeln!(out, "Replied to {id}")?;

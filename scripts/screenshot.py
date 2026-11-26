@@ -161,8 +161,15 @@ def agent_reply(binary: Path, cwd: Path, home: Path, text: str) -> None:
             [str(binary), "comments", *args], cwd=cwd, env=wtm_env(home), check=True, capture_output=True, text=True
         ).stdout
 
-    first = json.loads(wtm("list", "--json"))[0]["id"]
-    wtm("reply", first, "--by", "claude", text)
+    # The TUI may still be saving the comment on a slow machine.
+    for _ in range(50):
+        comments = json.loads(wtm("list", "--json"))
+        if comments:
+            break
+        time.sleep(0.1)
+    else:
+        raise SystemExit("no comment to reply to")
+    wtm("reply", comments[0]["id"], "--by", "claude", text)
 
 
 def capture(binary: Path, cwd: Path, home: Path, keys: list) -> pyte.Screen:

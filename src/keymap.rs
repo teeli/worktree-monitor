@@ -64,6 +64,7 @@ pub enum Action {
     PrevComment,
     CloseComment,
     Reply,
+    DeleteReply,
     ToggleClosed,
     Escape,
 }
@@ -223,7 +224,7 @@ pub const BINDINGS: &[Binding] = &[
         &["c"],
         A::Comment,
         "c",
-        "Comment on selected line (edit/delete it, or its highlighted reply)",
+        "Comment on selected line (edit/delete it, or your highlighted reply)",
     ),
     b(
         Comments,
@@ -259,6 +260,13 @@ pub const BINDINGS: &[Binding] = &[
         A::Reply,
         "R",
         "Reply to comment (selected line, else pane highlight)",
+    ),
+    b(
+        Comments,
+        &["D"],
+        A::DeleteReply,
+        "D",
+        "Delete the highlighted reply",
     ),
     b(
         Comments,
