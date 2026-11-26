@@ -27,6 +27,11 @@ commit history, side by side and updating in near-realtime.
   dropped, and reopens a closed one. Closed comments are hidden; `X` shows them, dimmed. Each records when and by whom
   it was closed; editing its text reopens it. Agents close comments with `wtm comments close` (see [below](#comments-from-the-command-line)), and
   the running app picks up the change within seconds.
+- **Replies.** `R` replies to the comment on the selected line (or highlighted in the pane); the thread is shown
+  below the comment and in the pane. `Ctrl-n` / `Ctrl-p` also stop at each reply; `c` on your highlighted reply
+  edits it (save empty to delete), and `D` deletes any highlighted reply. Replies record who wrote them, so others'
+  replies can't be edited. Agents reply with `wtm comments reply`, e.g. to say how a comment was handled or to ask a
+  question. Replies never open or close a comment.
 - **Copy the file path to the clipboard,** with `:line` (or `:start-end`) appended when diff lines are selected. Uses OSC 52 over SSH.
 - **Live updates** from file system events, with a full refresh every 30 seconds as a fallback (2-second polling
   when file watching is unavailable). Adding or removing worktrees updates
@@ -72,19 +77,21 @@ wtm --theme dracula      # or: export WTM_THEME=dracula
 
 ### Comments from the command line
 
-`wtm comments list`, `close` and `reopen` work on the comments of the worktree they are run in, e.g. for an AI agent
+`wtm comments list`, `reply`, `close` and `reopen` work on the comments of the worktree they are run in, e.g. for an AI agent
 that has handled review comments. (`wtm comments prune` is different: it covers all repositories, see
 [below](#cleaning-up-comment-files).)
 
 ```sh
-wtm comments list                     # open comments: id, file:line, commit, body
+wtm comments list                     # open comments: id, file:line, commit, body, replies
 wtm comments list --all --json        # include closed ones, as JSON (schema/comments.schema.json, ids as strings)
+wtm comments reply <ID> --by NAME TEXT...  # reply to a comment (--by defaults to "agent"); TEXT "-" reads stdin
 wtm comments close <ID>... --by NAME  # close fixed or dropped comments (--by defaults to "agent")
 wtm comments reopen <ID>...
 ```
 
 They find the worktree from any subdirectory, like git. Ids are 19-digit integers, beyond what many JSON parsers
-represent exactly, so `--json` prints them as strings. Editing a closed comment's text reopens it.
+represent exactly, so `--json` prints them (and reply ids) as strings. Editing a closed comment's text reopens it;
+replying doesn't.
 
 ### Cleaning up comment files
 
@@ -122,10 +129,12 @@ Press `?` in the app for the full list.
 | | `w` | Toggle soft wrap (off by default) |
 | | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp`, `gg` `G` | Half page / page / top / bottom |
 | | `Esc` | Clear line selection |
-| Comments | `c` | Comment on the selected line (edit if it has one; save empty to delete) |
+| Comments | `c` | Comment on the selected line (edit it, or your highlighted reply; save empty to delete) |
 | | `C` | Toggle the comments pane |
-| | `Ctrl-n` / `Ctrl-p` | Jump to next / previous comment (switching commit and file as needed) |
+| | `Ctrl-n` / `Ctrl-p` | Jump to next / previous comment or reply (switching commit and file as needed) |
 | | `x` | Close / reopen the comment on the selected line (else the one highlighted in the pane) |
+| | `R` | Reply to the comment on the selected line (else the one highlighted in the pane) |
+| | `D` | Delete the highlighted reply |
 | | `X` | Show / hide closed comments |
 | File tree | `Enter` / `Space` | Toggle directory (of the current file) |
 | | `H` / `Shift-←` | Collapse directory and all subdirectories |

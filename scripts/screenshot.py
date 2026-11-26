@@ -11,6 +11,7 @@ in a pseudo-terminal, sends a few keys and renders the resulting screen as a PNG
 """
 
 import fcntl
+import json
 import os
 import pty
 import select
@@ -146,7 +147,34 @@ def build_demo(base: Path) -> Path:
     return repo
 
 
-def capture(binary: Path, cwd: Path, home: Path, keys: list[tuple[str, float]]) -> pyte.Screen:
+def wtm_env(home: Path) -> dict[str, str]:
+    """Environment for wtm: HOME isolates git config and the comment files."""
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("XDG_STATE_HOME", None)
+    return env
+
+
+def agent_reply(binary: Path, cwd: Path, home: Path, text: str) -> None:
+    """Replies to the first comment from the CLI, as an agent would."""
+    def wtm(*args: str) -> str:
+        return subprocess.run(
+            [str(binary), "comments", *args], cwd=cwd, env=wtm_env(home), check=True, capture_output=True, text=True
+        ).stdout
+
+    # The TUI may still be saving the comment on a slow machine.
+    for _ in range(50):
+        comments = json.loads(wtm("list", "--json"))
+        if comments:
+            break
+        time.sleep(0.1)
+    else:
+        raise SystemExit("no comment to reply to")
+    wtm("reply", comments[0]["id"], "--by", "claude", text)
+
+
+def capture(binary: Path, cwd: Path, home: Path, keys: list) -> pyte.Screen:
+    """Runs wtm and sends `keys`: (text, wait) pairs, where text may instead be a function
+    run with (binary, cwd, home), e.g. to use the CLI meanwhile."""
     screen = pyte.Screen(COLS, ROWS)
     stream = pyte.ByteStream(screen)
     pid, fd = pty.fork()
@@ -154,10 +182,8 @@ def capture(binary: Path, cwd: Path, home: Path, keys: list[tuple[str, float]]) 
         os.chdir(cwd)
         # HOME isolates git from the user's config; SSH_TTY makes `y` use OSC 52
         # (swallowed by the emulator) instead of touching the real clipboard.
-        os.environ.update(
-            {"TERM": "xterm-256color", "HOME": str(home), "WTM_THEME": "dracula", "SSH_TTY": "/dev/null"}
-        )
-        os.execv(str(binary), [str(binary)])
+        env = wtm_env(home) | {"TERM": "xterm-256color", "WTM_THEME": "dracula", "SSH_TTY": "/dev/null"}
+        os.execve(str(binary), [str(binary)], env)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     def pump(seconds):
@@ -171,7 +197,10 @@ def capture(binary: Path, cwd: Path, home: Path, keys: list[tuple[str, float]]) 
 
     pump(2.0)
     for k, wait in keys:
-        os.write(fd, k.encode())
+        if callable(k):
+            k(binary, cwd, home)
+        else:
+            os.write(fd, k.encode())
         pump(wait)
     os.kill(pid, signal.SIGKILL)
     os.waitpid(pid, 0)
@@ -246,6 +275,11 @@ def main():
             (down * 2, 0.3),  # select the new `serve` signature
             ("c", 0.3),
             ("Pass the store by Arc so handlers can share it", 0.3),
+            ("\r", 0.3),
+            # an agent answers from the CLI; the TUI picks it up within a second
+            (lambda *a: agent_reply(*a, "Done: serve now takes Arc<Store>"), 1.5),
+            ("R", 0.3),  # reply to it
+            ("Thanks, looks good", 0.3),
             ("\r", 0.3),
             ("n", 0.6),  # src/server.rs
             ("j", 0.3),  # jump to the hunk
